@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <!-- 문서 메타/기본 설정 -->
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>투명 물방울 — 많은 하트</title>
+    <link rel="icon" href="data:," />
+
+    <style>
+      :root { color-scheme: dark; }
+      html, body { height: 100%; }
+      body {
+        margin: 0;
+        background: #0b1320; /* HDR 로딩 전 임시 배경 */
+        color: #e6e8ef;
+        overflow: hidden;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      }
+      #hud {
+        position: fixed; left: 12px; top: 10px; font-size: 12px;
+        opacity: 0.8; user-select: none; pointer-events: none;
+      }
+    </style>
+
+    <!-- Three.js 모듈 CDN 매핑 (주의: JSON이라 주석 넣으면 안 됨) -->
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+
+  <body>
+    <!-- 화면 안내 텍스트 -->
+    <div id="hud">여러 개의 하트 · 마우스로 회전 · 휠로 줌</div>
+
+    <script type="module">
+      /* ===== 1) 모듈 임포트 ===== */
+      import * as THREE from "three";
+      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+      import { RGBELoader } from "three/addons/loaders/RGBELoader.js";
+      import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+
+      /* ===== 2) 환경(HDRI) 소스 설정 ===== */
+      const ENV_URL =
+        "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/8k/spaichingen_hill_8k.hdr";
+
+      /* ===== 3) 렌더러 구성 ===== */
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.0;
+      document.body.appendChild(renderer.domElement);
+
+      /* ===== 4) 씬 & 카메라 ===== */
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+      camera.position.set(0, 0.4, 4.2);
+
+      /* ===== 5) 컨트롤 ===== */
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+
+      /* ===== 6) 공통 초기화 함수 start() ===== */
+      function start() {
+        // 6-1) 라이트
+        scene.add(new THREE.AmbientLight(0xffffff, 0.25));
+        const key = new THREE.DirectionalLight(0xffffff, 0.8);
+        key.position.set(2, 3, 1.5);
+        scene.add(key);
+
+        // ---------- 공통: 하트 지오메트리 생성 함수 ----------
+        function makeHeartGeometry() {
+          // 圓潤立體愛心外輪廓
+          const heartShape = new THREE.Shape();
+          const x = 0, y = 0;
+          const w = 0.45, top = 0.35, bottom = -0.2;
+
+          heartShape.moveTo(x + 0.0, y + top);
+          heartShape.bezierCurveTo(x + 0.0, y + top + 0.25, x - w,  y + top + 0.25, x - w,  y + top);
+          heartShape.bezierCurveTo(x - w,  y + 0.15,        x - 0.08, y - 0.15,        x + 0.0, y + bottom);
+          heartShape.bezierCurveTo(x + 0.08, y - 0.15,      x + w,    y + 0.15,        x + w,  y + top);
+          heartShape.bezierCurveTo(x + w,    y + top + 0.25, x + 0.0, y + top + 0.25,  x + 0.0, y + top);
+
+          const extrudeSettings = {
+            depth: 0.28,
+            bevelEnabled: true,
+            bevelSegments: 18,
+            steps: 1,
+            bevelSize: 0.06,
+            bevelThickness: 0.05,
+            curveSegments: 84
+          };
+          const g = new THREE.ExtrudeGeometry(heartShape, extrudeSettings);
+          g.center();
+          g.computeVertexNormals();
+          return g;
+        }
+
+        // ---------- 공통: 머티리얼(심장박동 + 표면잔물결) 생성 함수 ----------
+        function makeHeartMaterial(opts = {}) {
+          const {
+            color = 0xff69b4,
+            ior = 1.45,
+            roughness = 0.05,
+            thickness = 0.22,
+            envMapIntensity = 1.3,
+            attenuationColor = 0xffffff,
+            attenuationDistance = 1.2,
+            beatSpeed = 2.4,        // 心跳速度
+            amp = 0.04              // 表面波紋強度
+          } = opts;
+
+          const mat = new THREE.MeshPhysicalMaterial({
+            color,
+            metalness: 0.0,
+            roughness,
+            transmission: 1.0,
+            thickness,
+            ior,
+            clearcoat: 1.0,
+            clearcoatRoughness: 0.02,
+            attenuationColor: new THREE.Color(attenuationColor),
+            attenuationDistance,
+            envMapIntensity
+          });
+
+          // 注入波紋 + 心跳
+          mat.onBeforeCompile = (shader) => {
+            shader.uniforms.uTime = { value: 0 };
+            shader.uniforms.uBeatSpeed = { value: beatSpeed };
+            shader.uniforms.uAmp = { value: amp };
+            mat.userData.shader = shader;
+
+            shader.vertexShader = shader.vertexShader
+              .replace(
+                "#include <common>",
+                `
+                #include <common>
+                uniform float uTime;
+                uniform float uBeatSpeed;
+                uniform float uAmp;
+                `
+              )
+              .replace(
+                "#include <begin_vertex>",
+                `
+                vec3 transformed = vec3(position);
+                vec3 n = normalize(position);
+
+                // 基礎三向波
+                float f = 0.0;
+                float t = uTime;
+                f += sin(3.0 * n.x + t * 1.20);
+                f += sin(4.0 * n.y - t * 0.95);
+                f += sin(5.0 * n.z + t * 1.45);
+                f /= 3.0;
+
+                // 心跳包絡（0.7 ~ 1.3 之間）
+                float beat = 0.7 + 0.6 * pow(max(0.0, sin(t * uBeatSpeed)), 3.0);
+                f *= beat;
+
+                // 尖端/頂部減弱（避免過度變形）
+                float band = smoothstep(-0.2, 0.3, n.y) * (1.0 - smoothstep(0.6, 0.9, n.y));
+
+                // 依法線微位移
+                transformed += normal * (uAmp * f * (0.6 + 0.4 * band));
+                `
+              );
+          };
+
+          return mat;
+        }
+
+        // ---------- 6-2) 建立「很多不同」的愛心 ----------
+        const baseGeom = makeHeartGeometry();
+
+        // 配色（可自訂更多）
+        const palettes = [
+          { color: 0xff69b4, attenuationColor: 0xffa3d0 }, // 粉晶
+          { color: 0xff3b3b, attenuationColor: 0xffb0a0 }, // 熱情紅
+          { color: 0x66ccff, attenuationColor: 0xbfe8ff }, // 冰藍
+          { color: 0xffcc66, attenuationColor: 0xffe59a }, // 蜜桃金
+          { color: 0xb366ff, attenuationColor: 0xe0c4ff }, // 紫晶
+          { color: 0x66ffb3, attenuationColor: 0xb9ffd9 }, // 薄荷綠
+          { color: 0xffffff, attenuationColor: 0xffe6f7 }, // 透明白（微粉）
+        ];
+
+        // 生成配置（位置、縮放、材質差異）
+        const hearts = [];
+        const R = 2.3; // 環形半徑（圍繞中心）
+        const centerHeart = { x: 0, y: 0.15, z: 0, s: 1.1, rotY: 0.0, beat: 2.2 };
+        const countRing = 8;
+
+        // 中央一顆
+        {
+          const p = palettes[0];
+          const mat = makeHeartMaterial({
+            color: p.color,
+            attenuationColor: p.attenuationColor,
+            ior: 1.5, thickness: 0.28, envMapIntensity: 1.5,
+            beatSpeed: centerHeart.beat, amp: 0.05
+          });
+          const mesh = new THREE.Mesh(baseGeom, mat);
+          mesh.position.set(centerHeart.x, centerHeart.y, centerHeart.z);
+          mesh.scale.set(centerHeart.s, centerHeart.s, centerHeart.s);
+          hearts.push({ mesh, rotSpeed: 0.18, floatSpeed: 0.9 });
+          scene.add(mesh);
+        }
+
+        // 外圈多顆
+        for (let i = 0; i < countRing; i++) {
+          const t = (i / countRing) * Math.PI * 2;
+          const x = Math.cos(t) * R;
+          const z = Math.sin(t) * R * 0.85;
+          const y = (i % 2 === 0) ? 0.0 : 0.12;
+
+          // 每顆採不同調色與屬性
+          const p = palettes[(i + 1) % palettes.length];
+          const s = 0.6 + 0.25 * Math.sin(t * 2.0 + 0.5); // 大小差
+          const beatSpeed = 1.8 + 1.2 * Math.random();    // 心跳快慢差
+          const amp = 0.03 + 0.02 * Math.random();        // 波紋強度差
+          const thickness = 0.18 + 0.14 * Math.random();  // 厚薄差
+          const ior = 1.4 + 0.2 * Math.random();          // 折射率差
+
+          const mat = makeHeartMaterial({
+            color: p.color,
+            attenuationColor: p.attenuationColor,
+            ior, thickness, envMapIntensity: 1.2,
+            beatSpeed, amp
+          });
+
+          const mesh = new THREE.Mesh(baseGeom, mat);
+          mesh.position.set(x, y, z);
+          mesh.scale.set(s, s, s);
+          mesh.rotation.y = -t + Math.PI / 2; // 面向中心
+          hearts.push({ mesh, rotSpeed: 0.12 + 0.1 * Math.random(), floatSpeed: 0.8 + 0.5 * Math.random() });
+          scene.add(mesh);
+        }
+
+        // 6-3) 바닥(그림자 느낌용) — 살짝 어두운 원판
+        
+
+        // 6-4) 애니메이션 루프
+        const clock = new THREE.Clock();
+        function animate() {
+          const t = clock.getElapsedTime();
+          const dt = clock.getDelta();
+
+          // 更新所有材質的 uTime
+          for (const { mesh } of hearts) {
+            const mat = mesh.material;
+            if (mat.userData.shader) mat.userData.shader.uniforms.uTime.value = t;
+          }
+
+          // 中央與外圈：漂浮 + 旋轉 + squash&stretch
+          // 中央
+          {
+            const { mesh } = hearts[0];
+            mesh.position.y = 0.15 + Math.sin(t * 1.1) * 0.06;
+            const a = 0.10, s = Math.sin(t * 1.6);
+            mesh.scale.set(1.1 - 0.5 * a * s, 1.1 + a * s, 1.1 - 0.5 * a * s);
+            mesh.rotation.y += 0.18 * dt;
+          }
+          // 外圈
+          for (let i = 1; i < hearts.length; i++) {
+            const h = hearts[i];
+            h.mesh.position.y = (i % 2 === 0 ? 0.0 : 0.12) + Math.sin(t * h.floatSpeed + i) * 0.04;
+            h.mesh.rotation.y += h.rotSpeed * dt;
+
+            const a = 0.07, s = Math.sin(t * (1.3 + 0.1 * i));
+            const base = h.mesh.scale.x; // 等比
+            h.mesh.scale.set(base * (1.0 - 0.5 * a * s), base * (1.0 + a * s), base * (1.0 - 0.5 * a * s));
+          }
+
+          controls.update();
+          renderer.render(scene, camera);
+          requestAnimationFrame(animate);
+        }
+        animate();
+
+        // 6-5) 리사이즈 대응
+        window.addEventListener("resize", () => {
+          const w = window.innerWidth, h = window.innerHeight;
+          renderer.setSize(w, h);
+          camera.aspect = w / h;
+          camera.updateProjectionMatrix();
+        });
+      }
+
+      /* ===== 7) HDRI 로드 & 적용 (PMREM) ===== */
+      new RGBELoader().load(
+        ENV_URL,
+        (hdr) => {
+          const pmrem = new THREE.PMREMGenerator(renderer);
+          hdr.mapping = THREE.EquirectangularReflectionMapping;
+
+          const envRT = pmrem.fromEquirectangular(hdr);
+          scene.environment = envRT.texture;
+
+          scene.background = hdr;
+
+          hdr.dispose();
+          pmrem.dispose();
+          start();
+        },
+        undefined,
+        () => {
+          // 실패 시 RoomEnvironment로 폴백
+          const pmrem = new THREE.PMREMGenerator(renderer);
+          scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.04).texture;
+          scene.background = null;
+          pmrem.dispose();
+          start();
+        }
+      );
+    </script>
+  </body>
+</html>

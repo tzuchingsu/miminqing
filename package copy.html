@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Canyon • Marble • River</title>
+    <style>
+      html, body { height: 100%; margin: 0; }
+      body { overflow: hidden; background:#ffffff; }
+      canvas { display:block; }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/examples/jsm/controls/OrbitControls": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
+
+      /* ---------- Renderer ---------- */
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setClearColor(0xffffff, 1);
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      document.body.appendChild(renderer.domElement);
+
+      /* ---------- Scene / Camera / Controls ---------- */
+      const scene = new THREE.Scene();
+
+      const camera = new THREE.PerspectiveCamera(
+        60, window.innerWidth / window.innerHeight, 0.1, 1000
+      );
+      camera.position.set(22, 16, 22);
+      camera.lookAt(0, 0, 0);
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+
+      /* ---------- Lights ---------- */
+      const hemi = new THREE.HemisphereLight(0xffffff, 0x445566, 0.6);
+      hemi.position.set(0, 50, 0);
+      scene.add(hemi);
+
+      const dir = new THREE.DirectionalLight(0xffffff, 1.1);
+      dir.position.set(15, 22, 10);
+      dir.castShadow = true;
+      dir.shadow.mapSize.set(2048, 2048);
+      const s = 80;
+      dir.shadow.camera.left = -s; dir.shadow.camera.right = s;
+      dir.shadow.camera.top  =  s; dir.shadow.camera.bottom = -s;
+      dir.shadow.camera.near = 0.5; dir.shadow.camera.far = 200;
+      scene.add(dir);
+
+      /* ---------- Ground mesh ---------- */
+      const W=160, H=160, SEG=500;
+      const geo = new THREE.PlaneGeometry(W, H, SEG, SEG);
+      geo.rotateX(-Math.PI/2);
+
+      const mat = new THREE.ShaderMaterial({
+        uniforms: {
+          /* base fractal parameters */
+          uScale:        { value: 0.10 },
+          uAmp:          { value: 14.0 },
+          uOctaves:      { value: 6 },
+          uLacunarity:   { value: 2.0 },
+          uGain:         { value: 0.5 },
+          uGrow:         { value: 1.0 },
+
+          /* ridged */
+          uRidgeOffset:  { value: 0.9 },
+          uRidgeGain:    { value: 1.8 },
+          uRidgeSharp:   { value: 1.65 },
+          uRidgeH:       { value: 1.0 },
+
+          /* billow */
+          uH:            { value: 1.0 },
+          uBillowSharp:  { value: 1.2 },
+
+          /* domain warp (gives organic flow) */
+          uWarpAmp:       { value: 0.9 },
+          uWarpScale:     { value: 1.15 },
+          uWarpOctaves:   { value: 3 },
+          uWarpLacunarity:{ value: 2.0 },
+          uWarpGain:      { value: 0.5 },
+
+          /* canyon carve */
+          uCanyonWidth:  { value: 8.0 },   // 峽谷半寬(世界座標)
+          uCanyonDepth:  { value: 10.0 },  // 峽谷額外下切
+          uCanyonCurve:  { value: 0.12 },  // 峽谷中心線弧度(越大越彎)
+          uCanyonNoise:  { value: 0.8 },   // 峽谷中心抖動
+
+          /* river */
+          uRiverLevel:   { value: -2.0 },  // 河面高度(位移後, 世界Y)
+          uWaterColor:   { value: new THREE.Color(0x3aa8a0) }, // 藍綠
+          uWaterFoam:    { value: new THREE.Color(0xbfe9e5) },
+
+          /* marble look */
+          uMarbleScale:  { value: 0.18 },
+          uMarbleAmp:    { value: 6.0 },
+          uMarbleMix:    { value: 0.45 },
+
+          /* colors (rock / sand) */
+          uColA:         { value: new THREE.Color(0xe6ddce) }, // 淺岩
+          uColB:         { value: new THREE.Color(0x6e6d76) }, // 深岩
+
+          /* light & fog */
+          uLightDir:     { value: new THREE.Vector3(0.6,1.0,0.5).normalize() },
+          uCamPos:       { value: new THREE.Vector3() },
+          uFogColor:     { value: new THREE.Color(0xdfe4ea) },
+          uFogDensity:   { value: 0.015 }, // 0.01~0.03 清晨/黃昏薄霧
+        },
+        vertexShader: /* glsl */`
+          precision highp float; precision highp int;
+
+          uniform float uScale,uAmp,uGrow;
+          uniform int   uOctaves;
+          uniform float uLacunarity,uGain;
+          uniform float uRidgeOffset,uRidgeGain,uRidgeSharp,uRidgeH;
+          uniform float uH,uBillowSharp;
+
+          uniform float uWarpAmp,uWarpScale,uWarpLacunarity,uWarpGain;
+          uniform int   uWarpOctaves;
+
+          uniform float uCanyonWidth,uCanyonDepth,uCanyonCurve,uCanyonNoise;
+
+          varying vec3 vWorldPos;
+          varying float vH;     // 最終高度(位移前的[-1,1]值)
+          varying vec2  vXZ;    // 世界XZ（供片段再取樣法線）
+          varying float vCarve; // 峽谷遮罩(0~1)
+
+          /* --- simplex noise 2D --- */
+          vec3 mod289(vec3 x){ return x - floor(x*(1.0/289.0))*289.0; }
+          vec2 mod289(vec2 x){ return x - floor(x*(1.0/289.0))*289.0; }
+          vec3 permute(vec3 x){ return mod289(((x*34.0)+1.0)*x); }
+          float snoise(vec2 v){
+            const float C=0.211324865405187; const float F=0.366025403784439;
+            float s=(v.x+v.y)*F; vec2 i=floor(v+s); float t=(i.x+i.y)*C;
+            vec2 X0=i - t; vec2 x0=v - X0;
+            vec2 i1=(x0.x>x0.y)?vec2(1.0,0.0):vec2(0.0,1.0);
+            vec2 x1=x0 - i1 + C; vec2 x2=x0 - 1.0 + 2.0*C;
+            i=mod289(i);
+            vec3 p=permute( permute( i.y + vec3(0.0,i1.y,1.0)) + i.x + vec3(0.0,i1.x,1.0));
+            vec3 x=fract(p*(1.0/41.0))*2.0-1.0; vec3 h=abs(x)-0.5; vec3 ox=floor(x+0.5); vec3 a0=x-ox;
+            vec2 g0=vec2(a0.x,h.x), g1=vec2(a0.y,h.y), g2=vec2(a0.z,h.z);
+            vec3 w=max(0.5-vec3(dot(x0,x0),dot(x1,x1),dot(x2,x2)),0.0); vec3 w4=w*w*w*w;
+            float n0=dot(g0,x0), n1=dot(g1,x1), n2=dot(g2,x2);
+            return 40.0*dot(w4, vec3(n0,n1,n2));
+          }
+
+          float fbm(vec2 p,int oct,float lac,float gain){
+            float n=0.0,a=0.5,f=1.0;
+            for(int o=0;o<12;o++){ if(o>=oct)break; n+=snoise(p*f)*a; f*=lac; a*=gain; }
+            return n;
+          }
+          vec2 warp(vec2 p){
+            float x=fbm(p+vec2(37.2,17.5), uWarpOctaves, uWarpLacunarity, uWarpGain);
+            float y=fbm(p+vec2(-12.9,78.1),uWarpOctaves, uWarpLacunarity, uWarpGain);
+            return vec2(x,y);
+          }
+          vec2 applyWarp(vec2 p){ vec2 q=p*uWarpScale; return p + uWarpAmp*warp(q); }
+
+          float ridgeF(float n,float offset,float sharp){
+            float r=offset-abs(n); return pow(max(r,0.0), sharp);
+          }
+          float ridgedMF(vec2 p,int oct,float lac,float gainParam,
+                         float offset,float sharp,float H){
+            float sum=0.0,sumAmp=0.0,f=1.0,amp=1.0,weight=1.0;
+            for(int o=0;o<12;o++){ if(o>=oct)break;
+              float n=snoise(p*f);
+              float r=ridgeF(n,offset,sharp)*weight;
+              sum+=r*amp; sumAmp+=amp;
+              weight=clamp(r*gainParam,0.0,1.0); f*=lac; amp*=pow(lac,-H);
+            }
+            float v=sum/max(sumAmp,1e-6); return v*2.0-1.0;
+          }
+          float billowMF(vec2 p,int oct,float lac,float H,float sharp){
+            float sum=0.0,sumAmp=0.0,f=1.0,amp=1.0;
+            for(int o=0;o<12;o++){ if(o>=oct)break;
+              float r=pow(abs(snoise(p*f)), sharp);
+              sum+=r*amp; sumAmp+=amp; f*=lac; amp*=pow(lac,-H);
+            }
+            float v=sum/max(sumAmp,1e-6); return v*2.0-1.0;
+          }
+
+          // 峽谷遮罩：沿 Z 軸的彎曲中心線 + 噪聲抖動，帶狀下切
+          float canyonMask(vec2 xz){
+            float curve = sin(xz.y * uCanyonCurve) * 10.0;
+            float jitter= snoise(xz*0.07)*uCanyonNoise*6.0;
+            float dx = abs(xz.x - (curve + jitter));
+            float w  = uCanyonWidth;
+            // 0~1: 中央=1(最深), 邊界=0
+            return clamp(1.0 - smoothstep(w*0.3, w, dx), 0.0, 1.0);
+          }
+
+          void main(){
+            vec3 pos = position;
+            vec2 p   = pos.xz * uScale;
+
+            // 有機流動
+            vec2 pw = applyWarp(p);
+
+            // 基底：稜線+丘陵混合（高處偏稜線、低處偏丘陵）
+            float hR = ridgedMF(pw, uOctaves, uLacunarity, uRidgeGain, 0.9, uRidgeSharp, uRidgeH);
+            float hB = billowMF(pw, uOctaves, uLacunarity, uH, uBillowSharp);
+            float maskH = smoothstep(0.15, 0.65, 0.5*(hR+1.0));
+            float h = mix(hB, hR, maskH);
+
+            // 峽谷切割（沿Z方向彎曲）
+            float carve = canyonMask(pos.xz);
+            h -= carve * (uCanyonDepth / max(uAmp, 0.0001)); // 折算到[-1,1]空間
+
+            pos.y += h * uAmp * uGrow;
+
+            vH = h;           // 保存[-1,1]高度
+            vXZ = pos.xz;     // 世界XZ（已經旋轉到水平面）
+            vCarve = carve;   // 峽谷權重
+            vec4 wp = modelMatrix * vec4(pos,1.0);
+            vWorldPos = wp.xyz;
+            gl_Position = projectionMatrix * viewMatrix * wp;
+          }
+        `,
+        fragmentShader: /* glsl */`
+          precision highp float; precision highp int;
+
+          uniform vec3  uLightDir;
+          uniform vec3  uCamPos;
+
+          uniform float uScale,uAmp,uGrow;
+          uniform int   uOctaves;
+          uniform float uLacunarity,uGain;
+          uniform float uRidgeOffset,uRidgeGain,uRidgeSharp,uRidgeH;
+          uniform float uH,uBillowSharp;
+
+          uniform float uWarpAmp,uWarpScale,uWarpLacunarity,uWarpGain;
+          uniform int   uWarpOctaves;
+
+          uniform vec3  uColA, uColB;
+
+          uniform float uMarbleScale, uMarbleAmp, uMarbleMix;
+
+          uniform float uRiverLevel;
+          uniform vec3  uWaterColor, uWaterFoam;
+
+          uniform vec3  uFogColor;
+          uniform float uFogDensity;
+
+          varying vec3 vWorldPos;
+          varying float vH;
+          varying vec2  vXZ;
+          varying float vCarve;
+
+          /* --- same noise helpers (snoise2 names to avoid collisions) --- */
+          vec3 mod289_vec3(vec3 x){ return x - floor(x*(1.0/289.0))*289.0; }
+          vec2 mod289_vec2(vec2 x){ return x - floor(x*(1.0/289.0))*289.0; }
+          vec3 permute_vec3(vec3 x){ return mod289_vec3(((x*34.0)+1.0)*x); }
+          float snoise2(vec2 v){
+            const float C=0.211324865405187; const float F=0.366025403784439;
+            float s=(v.x+v.y)*F; vec2 i=floor(v+s); float t=(i.x+i.y)*C;
+            vec2 X0=i - t; vec2 x0=v - X0;
+            vec2 i1=(x0.x>x0.y)?vec2(1.0,0.0):vec2(0.0,1.0);
+            vec2 x1=x0 - i1 + C; vec2 x2=x0 - 1.0 + 2.0*C;
+            i=mod289_vec2(i);
+            vec3 p=permute_vec3( permute_vec3( i.y + vec3(0.0,i1.y,1.0)) + i.x + vec3(0.0,i1.x,1.0));
+            vec3 x=fract(p*(1.0/41.0))*2.0-1.0; vec3 h=abs(x)-0.5; vec3 ox=floor(x+0.5); vec3 a0=x-ox;
+            vec2 g0=vec2(a0.x,h.x), g1=vec2(a0.y,h.y), g2=vec2(a0.z,h.z);
+            vec3 w=max(0.5-vec3(dot(x0,x0),dot(x1,x1),dot(x2,x2)),0.0); vec3 w4=w*w*w*w;
+            float n0=dot(g0,x0), n1=dot(g1,x1), n2=dot(g2,x2);
+            return 40.0*dot(w4, vec3(n0,n1,n2));
+          }
+          float fbm2(vec2 p,int oct,float lac,float gain){
+            float n=0.0,a=0.5,f=1.0;
+            for(int o=0;o<12;o++){ if(o>=oct)break; n+=snoise2(p*f)*a; f*=lac; a*=gain; }
+            return n;
+          }
+          vec2 warp2(vec2 p){
+            float x=fbm2(p+vec2(37.2,17.5), 3, 2.0, 0.5);
+            float y=fbm2(p+vec2(-12.9,78.1),3, 2.0, 0.5);
+            return vec2(x,y);
+          }
+          vec2 applyWarp2(vec2 p, float amp, float scl){
+            vec2 q=p*scl; return p + amp*warp2(q);
+          }
+          float ridgeF2(float n,float offset,float sharp){
+            float r=offset-abs(n); return pow(max(r,0.0), sharp);
+          }
+          float ridgedMF2(vec2 p,int oct,float lac,float gainParam,
+                          float offset,float sharp,float H){
+            float sum=0.0,sumAmp=0.0,f=1.0,amp=1.0,weight=1.0;
+            for(int o=0;o<12;o++){ if(o>=oct)break;
+              float n=snoise2(p*f);
+              float r=ridgeF2(n,offset,sharp)*weight;
+              sum+=r*amp; sumAmp+=amp;
+              weight=clamp(r*gainParam,0.0,1.0); f*=lac; amp*=pow(lac,-H);
+            }
+            float v=sum/max(sumAmp,1e-6); return v*2.0-1.0;
+          }
+          float billowMF2(vec2 p,int oct,float lac,float H,float sharp){
+            float sum=0.0,sumAmp=0.0,f=1.0,amp=1.0;
+            for(int o=0;o<12;o++){ if(o>=oct)break;
+              float r=pow(abs(snoise2(p*f)), sharp);
+              sum+=r*amp; sumAmp+=amp; f*=lac; amp*=pow(lac,-H);
+            }
+            float v=sum/max(sumAmp,1e-6); return v*2.0-1.0;
+          }
+
+          // 與頂點一致的峽谷遮罩 (用於法線/顏色一致性)
+          float canyonMask2(vec2 xz, float width, float curve, float noiseAmt){
+            float curveLine = sin(xz.y * curve) * 10.0;
+            float jitter = snoise2(xz*0.07) * noiseAmt * 6.0;
+            float dx = abs(xz.x - (curveLine + jitter));
+            return clamp(1.0 - smoothstep(width*0.3, width, dx), 0.0, 1.0);
+          }
+
+          // 重新計算位移高度，用於法線近似/水面判斷
+          float sampleHeight(vec2 worldXZ){
+            vec2 p = (worldXZ) * uScale;
+            vec2 pw = applyWarp2(p, 0.9, 1.15);
+            float hR = ridgedMF2(pw, 6, uLacunarity, 1.8, 0.9, 1.65, 1.0);
+            float hB = billowMF2(pw, 6, uLacunarity, uH, uBillowSharp);
+            float maskH = smoothstep(0.15, 0.65, 0.5*(hR+1.0));
+            float h = mix(hB, hR, maskH);
+            float carve = canyonMask2(worldXZ, 8.0, 0.12, 0.8);
+            h -= carve * (10.0 / max(uAmp, 0.0001));
+            return h * uAmp * uGrow; // 轉為世界高度增量
+          }
+
+          void main(){
+            /* --- 法線近似（偏移取樣） --- */
+            float eps = 0.6;
+            float hC = sampleHeight(vXZ);
+            float hX = sampleHeight(vXZ + vec2(eps,0.0));
+            float hZ = sampleHeight(vXZ + vec2(0.0,eps));
+            vec3 dX = vec3(eps, hX - hC, 0.0);
+            vec3 dZ = vec3(0.0, hZ - hC, eps);
+            vec3 N  = normalize(cross(dZ, dX));
+
+            /* --- 基底岩色 --- */
+            float ridgeBias = smoothstep(0.15, 0.65, 0.5*(vH+1.0));
+            vec3  baseRock  = mix(uColA, uColB, ridgeBias);
+
+            /* --- 大理石條帶（sin + fbm 扭曲） --- */
+            float marble =
+              sin( vXZ.x * uMarbleScale * uMarbleAmp
+                   + fbm2(vXZ*0.15, 4, 2.0, 0.5) * 6.0 );
+            marble = smoothstep(-0.2, 0.8, marble);
+            vec3 marbleCol = mix(vec3(0.96,0.96,0.93), vec3(0.72,0.72,0.76), marble);
+            vec3 rockCol   = mix(baseRock, marbleCol, uMarbleMix);
+
+            /* --- 光照 --- */
+            float diff = clamp(dot(N, normalize(uLightDir)), 0.0, 1.0);
+            float ambient = 0.65;
+            vec3 lit = rockCol * (ambient + (1.0 - ambient) * diff);
+
+            /* --- 水域（藍綠 + 泡影沿峽谷） --- */
+            // 世界高度 = 位移後的世界 y
+            float worldY = vWorldPos.y;
+            float waterMask = smoothstep(uRiverLevel+0.4, uRiverLevel-0.1, worldY);
+            // 泡沫：峽谷中心 + 坡度較陡處
+            float foam = clamp((1.0 - abs(N.y))*0.8 + vCarve*0.6, 0.0, 1.0);
+            vec3 water = mix(uWaterColor, uWaterFoam, pow(foam, 2.0));
+            vec3 color = mix(lit, water, waterMask);
+
+            /* --- 指向性微高光（濕岩質感） --- */
+            vec3 V = normalize(uCamPos - vWorldPos);
+            vec3 H = normalize(V + normalize(uLightDir));
+            float spec = pow(max(dot(N,H),0.0), 32.0) * 0.15;
+            color += spec * (1.0 - waterMask) + spec*0.6*waterMask;
+
+            /* --- 霧（晨昏薄霧） --- */
+            float dist = length(uCamPos - vWorldPos);
+            float fogFactor = 1.0 - exp(-uFogDensity * uFogDensity * dist * dist);
+            vec3 finalCol = mix(color, uFogColor, clamp(fogFactor, 0.0, 1.0));
+
+            gl_FragColor = vec4(finalCol, 1.0);
+          }
+        `,
+      });
+
+      const ground = new THREE.Mesh(geo, mat);
+      ground.castShadow = true;
+      ground.receiveShadow = true;
+      scene.add(ground);
+
+      /* ---------- Resize ---------- */
+      window.addEventListener("resize", () => {
+        const w = window.innerWidth, h = window.innerHeight;
+        camera.aspect = w / h; camera.updateProjectionMatrix();
+        renderer.setSize(w, h);
+      });
+
+      /* ---------- Animate ---------- */
+      const clock = new THREE.Clock();
+      function animate(){
+        const dt = clock.getDelta();
+        controls.update();
+
+        // 將相機位置傳給著色器（用於霧與高光）
+        mat.uniforms.uCamPos.value.copy(camera.position);
+
+        renderer.render(scene, camera);
+        requestAnimationFrame(animate);
+      }
+      animate();
+    </script>
+  </body>
+</html>

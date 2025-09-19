@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Canyon: Terrace fBm + OpenSimplex, Flat River (Light Fog)</title>
+    <style>
+      html, body { height: 100%; margin: 0; }
+      body { overflow: hidden; background: #ffffff; }
+      canvas { display: block; }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/examples/jsm/controls/OrbitControls": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
+
+      // -----------------------
+      // 1) Renderer / Scene / Camera
+      // -----------------------
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setClearColor(0xffffff, 1);
+      renderer.shadowMap.enabled = true;
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      document.body.appendChild(renderer.domElement);
+
+      const scene = new THREE.Scene();
+      // 霧改很淡：Exp2 密度從 0.0085 -> 0.002
+      scene.fog = new THREE.FogExp2(0xffffff, 0.002);
+
+      const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+      camera.position.set(22, 18, 22);
+      camera.lookAt(0, 0, 0);
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+
+      // -----------------------
+      // 2) Lights
+      // -----------------------
+      // 天空光稍亮，底色偏藍綠
+      const hemi = new THREE.HemisphereLight(0xffffff, 0x668899, 0.6);
+      hemi.position.set(0, 50, 0);
+      scene.add(hemi);
+
+      const dir = new THREE.DirectionalLight(0xffffff, 0.95);
+      dir.position.set(18, 28, 14);
+      dir.castShadow = true;
+      dir.shadow.mapSize.set(2048, 2048);
+      dir.shadow.camera.near = 0.5;
+      dir.shadow.camera.far = 120;
+      const s = 60;
+      dir.shadow.camera.left = -s; dir.shadow.camera.right = s;
+      dir.shadow.camera.top  =  s; dir.shadow.camera.bottom = -s;
+      scene.add(dir);
+
+      // -----------------------
+      // 3) Ground geometry (terrain)
+      // -----------------------
+      const W = 140, H = 140, SEGX = 420, SEGY = 420;
+      const groundGeo = new THREE.PlaneGeometry(W, H, SEGX, SEGY);
+      groundGeo.rotateX(-Math.PI / 2);
+
+      const groundMat = new THREE.ShaderMaterial({
+        uniforms: {
+          // 基礎 fBm
+          uScale:        { value: 0.65 },
+          uAmp:          { value: 13.0 },
+          uOctaves:      { value: 7     },
+          uLacunarity:   { value: 2.0   },
+          uGain:         { value: 0.45  },
+          uGrow:         { value: 1.0   },
+
+          // A：Terrace fBm（HEIGHT）
+          uAScale:        { value: 0.20 },
+          uATerraceSteps: { value: 6.0  },
+
+          // B：OpenSimplex（MASK）
+          uBScale:    { value: 0.20 },
+          uBThreshLo: { value: 0.40 },
+          uBThreshHi: { value: 0.60 },
+
+          // 峽谷 & 河道
+          uRimGain:      { value: 0.20 }, // B 對整體高度權重
+          uRiverWidth:   { value: 3.8  }, // 河寬（噪聲空間）
+          uRiverFeather: { value: 0.25 }, // 河岸羽化
+          uRiverBase:    { value: -0.55 },// 河床高度（噪聲高度）
+
+          // 顏色 & 光
+          uColGrass:  { value: new THREE.Color(0x7bb66f) },
+          uColForest: { value: new THREE.Color(0x1f3a29) },
+          uColRock:   { value: new THREE.Color(0x2e4a3f) },
+          uColRiver:  { value: new THREE.Color(0x2a9ec2) },
+          uLightDir:  { value: new THREE.Vector3(0.6, 1.0, 0.5).normalize() },
+
+          // 霧（手動淡化用，場景也設了 Exp2，但這裡再細調）
+          uFogDensity:   { value: 0.00008 } // 原 0.00025 -> 0.00008（更淡、影響距離更遠）
+        },
+        vertexShader: /* glsl */`
+          precision highp float;
+          precision highp int;
+
+          uniform float uScale, uAmp, uGrow;
+          uniform int   uOctaves;
+          uniform float uLacunarity, uGain;
+          uniform float uAScale, uATerraceSteps;
+          uniform float uBScale, uBThreshLo, uBThreshHi;
+          uniform float uRimGain;
+          uniform float uRiverWidth, uRiverFeather, uRiverBase;
+
+          varying vec3  vWorldPos;
+          varying float vH;            // 噪聲高度（-1..1）
+          varying float vRiverMask;    // 河道權重 [0..1]
+
+          // ---- Simplex 2D ----
+          vec3 mod289(vec3 x){ return x - floor(x * (1.0/289.0)) * 289.0; }
+          vec2 mod289(vec2 x){ return x - floor(x * (1.0/289.0)) * 289.0; }
+          vec3 permute(vec3 x){ return mod289(((x*34.0)+1.0)*x); }
+
+          float snoise(vec2 v){
+            const float C = 0.211324865405187;
+            const float F = 0.366025403784439;
+            float s = (v.x+v.y)*F;
+            vec2 i = floor(v + s);
+            float t = (i.x + i.y) * C;
+            vec2 X0 = i - t;
+            vec2 x0 = v - X0;
+
+            vec2 i1 = (x0.x > x0.y) ? vec2(1.0,0.0) : vec2(0.0,1.0);
+            vec2 x1 = x0 - i1 + C;
+            vec2 x2 = x0 - 1.0 + 2.0*C;
+
+            i = mod289(i);
+            vec3 p = permute( permute( i.y + vec3(0.0, i1.y, 1.0) )
+                            + i.x + vec3(0.0, i1.x, 1.0) );
+
+            vec3 x = fract(p * (1.0/41.0)) * 2.0 - 1.0;
+            vec3 h = abs(x) - 0.5;
+            vec3 ox = floor(x + 0.5);
+            vec3 a0 = x - ox;
+
+            vec2 g0 = vec2(a0.x, h.x);
+            vec2 g1 = vec2(a0.y, h.y);
+            vec2 g2 = vec2(a0.z, h.z);
+
+            vec3 w = max(0.5 - vec3(dot(x0,x0), dot(x1,x1), dot(x2,x2)), 0.0);
+            vec3 w4 = w*w*w*w;
+
+            float n0 = dot(g0, x0);
+            float n1 = dot(g1, x1);
+            float n2 = dot(g2, x2);
+
+            return 40.0 * dot(w4, vec3(n0,n1,n2));
+          }
+
+          // fBm + Terrace（A：HEIGHT）
+          float fbm_simple(vec2 p, int oct, float lac, float gain){
+            float n = 0.0, a = 0.5, f = 1.0;
+            for(int o=0;o<12;o++){
+              if(o>=oct) break;
+              n += snoise(p*f) * a;
+              f *= lac; a *= gain;
+            }
+            return clamp(n, -1.0, 1.0);
+          }
+          float terrace(float h, float steps){
+            float s = max(2.0, steps);
+            float u = 0.5*h + 0.5;
+            float t = floor(u*s)/s;
+            return t*2.0 - 1.0;
+          }
+          float genA(vec2 p){ // [-1,1]
+            float h = fbm_simple(p, uOctaves, uLacunarity, uGain);
+            return terrace(h, uATerraceSteps);
+          }
+
+          // OpenSimplex 近似（B：MASK）
+          float genB(vec2 p){ // [0,1]
+            float n = snoise(p);
+            float m = 0.5*n + 0.5;
+            return smoothstep(uBThreshLo, uBThreshHi, m);
+          }
+
+          // 河道：沿世界 x=0 的縱向帶狀
+          float riverMask(vec2 pNoise){
+            float a = abs(pNoise.x);
+            // 更銳利的峭壁：窄羽化 + pow
+            float edge = 1.0 - smoothstep(uRiverWidth, uRiverWidth + uRiverFeather, a);
+            return pow(edge, 2.0);
+          }
+
+          void main(){
+            vec3 pos = position;
+            vec2 pWorld = pos.xz;
+            vec2 pNoise = pWorld * uScale;
+
+            // 你的山：Terrace fBm + B 的 rim 增益
+            float A = genA(pNoise * uAScale);   // [-1,1]
+            float B = genB(pNoise * uBScale);   // [0,1]
+            float h = A + uRimGain * B;         // 山體（噪聲空間）
+
+            // 用河道遮罩把噪聲高度混到固定河床高度
+            float mRiver = riverMask(pNoise);
+            h = mix(h, uRiverBase, mRiver);
+
+            pos.y += h * uAmp * uGrow;
+
+            vH = h;
+            vRiverMask = mRiver;
+            vec4 wp = modelMatrix * vec4(pos,1.0);
+            vWorldPos = wp.xyz;
+            gl_Position = projectionMatrix * viewMatrix * wp;
+          }
+        `,
+        fragmentShader: /* glsl */`
+          precision highp float;
+          precision highp int;
+
+          uniform vec3  uLightDir;
+          uniform float uScale, uAmp, uGrow;
+          uniform int   uOctaves;
+          uniform float uLacunarity, uGain;
+          uniform float uAScale, uATerraceSteps;
+          uniform float uBScale, uBThreshLo, uBThreshHi;
+          uniform float uRimGain;
+          uniform float uRiverWidth, uRiverFeather, uRiverBase;
+
+          uniform vec3  uColGrass, uColForest, uColRock, uColRiver;
+
+          // 霧（手動調淡）
+          uniform float uFogDensity;
+
+          varying vec3  vWorldPos;
+          varying float vH;
+          varying float vRiverMask;
+
+          // 與頂點同一組噪聲（給法線近似）
+          vec3 mod289_vec3(vec3 x){ return x - floor(x*(1.0/289.0))*289.0; }
+          vec2 mod289_vec2(vec2 x){ return x - floor(x*(1.0/289.0))*289.0; }
+          vec3 permute_vec3(vec3 x){ return mod289_vec3(((x*34.0)+1.0)*x); }
+          float snoise2(vec2 v){
+            const float C = 0.211324865405187;
+            const float F = 0.366025403784439;
+            float s = (v.x+v.y)*F;
+            vec2 i = floor(v + s);
+            float t = (i.x + i.y) * C;
+            vec2 X0 = i - t;
+            vec2 x0 = v - X0;
+
+            vec2 i1 = (x0.x > x0.y) ? vec2(1.0,0.0) : vec2(0.0,1.0);
+            vec2 x1 = x0 - i1 + C;
+            vec2 x2 = x0 - 1.0 + 2.0*C;
+
+            i = mod289_vec2(i);
+            vec3 p = permute_vec3( permute_vec3( i.y + vec3(0.0, i1.y, 1.0))
+                                 + i.x + vec3(0.0, i1.x, 1.0));
+            vec3 x = fract(p * (1.0/41.0)) * 2.0 - 1.0;
+            vec3 h = abs(x) - 0.5;
+            vec3 ox = floor(x + 0.5);
+            vec3 a0 = x - ox;
+
+            vec2 g0 = vec2(a0.x, h.x);
+            vec2 g1 = vec2(a0.y, h.y);
+            vec2 g2 = vec2(a0.z, h.z);
+
+            vec3 w = max(0.5 - vec3(dot(x0,x0), dot(x1,x1), dot(x2,x2)), 0.0);
+            vec3 w4 = w*w*w*w;
+
+            float n0 = dot(g0, x0);
+            float n1 = dot(g1, x1);
+            float n2 = dot(g2, x2);
+
+            return 40.0 * dot(w4, vec3(n0,n1,n2));
+          }
+          float fbm2(vec2 p, int oct, float lac, float gain){
+            float n=0.0,a=0.5,f=1.0;
+            for(int o=0;o<12;o++){ if(o>=oct) break;
+              n += snoise2(p*f)*a; f*=lac; a*=gain;
+            }
+            return clamp(n,-1.0,1.0);
+          }
+          float terrace2(float h, float steps){
+            float s=max(2.0,steps); float u=0.5*h+0.5; float t=floor(u*s)/s; return t*2.0-1.0;
+          }
+          float genA2(vec2 p){ return terrace2(fbm2(p, uOctaves, uLacunarity, uGain), uATerraceSteps); }
+          float genB2(vec2 p){ float n=snoise2(p); float m=0.5*n+0.5; return smoothstep(uBThreshLo,uBThreshHi,m); }
+          float riverMask2(vec2 pNoise){
+            float a = abs(pNoise.x);
+            float edge = 1.0 - smoothstep(uRiverWidth, uRiverWidth + uRiverFeather, a);
+            return pow(edge, 2.0);
+          }
+
+          // 高度差近似法線（需與頂點同路徑）
+          vec3 calcNormal(vec2 wxz){
+            float eps = 0.35;
+            vec2 p0 = wxz * uScale;
+
+            float A0 = genA2(p0 * uAScale);
+            float B0 = genB2(p0 * uBScale);
+            float h0 = mix(A0 + uRimGain*B0, uRiverBase, riverMask2(p0));
+            float H0 = h0 * uAmp * uGrow;
+
+            vec2 px = (wxz + vec2(eps,0.0)) * uScale;
+            float Ax = genA2(px * uAScale);
+            float Bx = genB2(px * uBScale);
+            float hx = mix(Ax + uRimGain*Bx, uRiverBase, riverMask2(px));
+            float HX = hx * uAmp * uGrow;
+
+            vec2 pz = (wxz + vec2(0.0,eps)) * uScale;
+            float Az = genA2(pz * uAScale);
+            float Bz = genB2(pz * uBScale);
+            float hz = mix(Az + uRimGain*Bz, uRiverBase, riverMask2(pz));
+            float HZ = hz * uAmp * uGrow;
+
+            vec3 dX = vec3(eps, HX - H0, 0.0);
+            vec3 dZ = vec3(0.0, HZ - H0, eps);
+            return normalize(cross(dZ, dX));
+          }
+
+          void main(){
+            // 基礎地表顏色：高度＋森林遮罩混色
+            float h01 = clamp(0.5*(vH + 1.0), 0.0, 1.0);   // [-1,1] -> [0,1]
+            float forestMask = genB2(vWorldPos.xz * uScale * uBScale); // [0,1]
+            vec3 groundCol = mix(uColGrass, uColRock, smoothstep(0.45, 0.75, h01));
+            groundCol = mix(groundCol, uColForest, forestMask * 0.6);
+
+            // 河道覆蓋
+            vec3 baseCol = mix(groundCol, uColRiver, vRiverMask);
+
+            // 簡單光照
+            vec3 N = calcNormal(vWorldPos.xz);
+            float diff = clamp(dot(N, normalize(uLightDir)), 0.0, 1.0);
+            float ambient = 0.70;
+            vec3 col = baseCol * (ambient + (1.0 - ambient) * diff);
+
+            // 手動霧：係數調淡（uFogDensity）
+            float dist = length(vWorldPos.xz); // 水平距離為主，避免近地表過白
+            float fogFactor = 1.0 - exp(-uFogDensity * dist * dist);
+            col = mix(col, vec3(1.0), fogFactor);
+
+            gl_FragColor = vec4(col, 1.0);
+          }
+        `,
+        side: THREE.FrontSide
+      });
+
+      const ground = new THREE.Mesh(groundGeo, groundMat);
+      ground.castShadow = true;
+      ground.receiveShadow = true;
+      scene.add(ground);
+
+      // 深度材質位移對齊，陰影不飄
+      const depthMat = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
+      depthMat.onBeforeCompile = (shader)=>{
+        shader.uniforms.uScale        = groundMat.uniforms.uScale;
+        shader.uniforms.uAmp          = groundMat.uniforms.uAmp;
+        shader.uniforms.uGrow         = groundMat.uniforms.uGrow;
+        shader.uniforms.uOctaves      = groundMat.uniforms.uOctaves;
+        shader.uniforms.uLacunarity   = groundMat.uniforms.uLacunarity;
+        shader.uniforms.uGain         = groundMat.uniforms.uGain;
+        shader.uniforms.uAScale       = groundMat.uniforms.uAScale;
+        shader.uniforms.uATerraceSteps= groundMat.uniforms.uATerraceSteps;
+        shader.uniforms.uBScale       = groundMat.uniforms.uBScale;
+        shader.uniforms.uBThreshLo    = groundMat.uniforms.uBThreshLo;
+        shader.uniforms.uBThreshHi    = groundMat.uniforms.uBThreshHi;
+        shader.uniforms.uRimGain      = groundMat.uniforms.uRimGain;
+        shader.uniforms.uRiverWidth   = groundMat.uniforms.uRiverWidth;
+        shader.uniforms.uRiverFeather = groundMat.uniforms.uRiverFeather;
+        shader.uniforms.uRiverBase    = groundMat.uniforms.uRiverBase;
+
+        shader.vertexShader = shader.vertexShader.replace(
+          '#include <common>',
+          `#include <common>
+           uniform float uScale, uAmp, uGrow;
+           uniform int   uOctaves;
+           uniform float uLacunarity, uGain;
+           uniform float uAScale, uATerraceSteps;
+           uniform float uBScale, uBThreshLo, uBThreshHi;
+           uniform float uRimGain;
+           uniform float uRiverWidth, uRiverFeather, uRiverBase;
+
+           vec3 mod289(vec3 x){ return x - floor(x*(1.0/289.0))*289.0; }
+           vec2 mod289(vec2 x){ return x - floor(x*(1.0/289.0))*289.0; }
+           vec3 permute(vec3 x){ return mod289(((x*34.0)+1.0)*x); }
+           float snoise(vec2 v){
+             const float C=0.211324865405187, F=0.366025403784439;
+             float s=(v.x+v.y)*F; vec2 i=floor(v+s);
+             float t=(i.x+i.y)*C; vec2 X0=i-t; vec2 x0=v-X0;
+             vec2 i1=(x0.x>x0.y)?vec2(1.0,0.0):vec2(0.0,1.0);
+             vec2 x1=x0-i1+C; vec2 x2=x0-1.0+2.0*C;
+             i=mod289(i);
+             vec3 p=permute( permute(i.y+vec3(0.0,i1.y,1.0)) + i.x+vec3(0.0,i1.x,1.0));
+             vec3 x=fract(p*(1.0/41.0))*2.0-1.0; vec3 h=abs(x)-0.5; vec3 ox=floor(x+0.5);
+             vec3 a0=x-ox; vec2 g0=vec2(a0.x,h.x), g1=vec2(a0.y,h.y), g2=vec2(a0.z,h.z);
+             vec3 w=max(0.5-vec3(dot(x0,x0),dot(x1,x1),dot(x2,x2)),0.0); vec3 w4=w*w*w*w;
+             float n0=dot(g0,x0), n1=dot(g1,x1), n2=dot(g2,x2);
+             return 40.0 * dot(w4, vec3(n0,n1,n2));
+           }
+           float fbm(vec2 p, int oct, float lac, float gain){
+             float n=0.0,a=0.5,f=1.0; for(int o=0;o<12;o++){ if(o>=oct) break;
+               n += snoise(p*f)*a; f*=lac; a*=gain; } return clamp(n,-1.0,1.0);
+           }
+           float terrace(float h, float steps){
+             float s=max(2.0,steps); float u=0.5*h+0.5; float t=floor(u*s)/s; return t*2.0-1.0;
+           }
+           float genA(vec2 p){ return terrace(fbm(p,uOctaves,uLacunarity,uGain), uATerraceSteps); }
+           float genB(vec2 p){ float n=snoise(p); float m=0.5*n+0.5; return smoothstep(uBThreshLo,uBThreshHi,m); }
+           float riverMask(vec2 pNoise){
+             float a=abs(pNoise.x);
+             float edge=1.0 - smoothstep(uRiverWidth, uRiverWidth + uRiverFeather, a);
+             return pow(edge, 2.0);
+           }`
+        ).replace(
+          '#include <begin_vertex>',
+          `#include <begin_vertex>
+           vec2 pN = (vec3(transformed).xz) * uScale;
+           float A = genA(pN * uAScale);
+           float B = genB(pN * uBScale);
+           float h = mix(A + uRimGain*B, uRiverBase, riverMask(pN));
+           transformed.y += h * uAmp * uGrow;`
+        );
+      };
+      ground.customDepthMaterial = depthMat;
+
+      // -----------------------
+      // -----------------------
+// 4) River water plane (波紋水面)
+// -----------------------
+const riverWidthWorld = 2.0 * groundMat.uniforms.uRiverWidth.value / groundMat.uniforms.uScale.value;
+const waterGeo = new THREE.PlaneGeometry(riverWidthWorld, H, 200, 200); // 多切割一點讓頂點能位移
+waterGeo.rotateX(-Math.PI / 2);
+
+const waterMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uTime:     { value: 0.0 },
+    uWaveAmp:  { value: 0.08 },   // 波紋振幅 (高度)
+    uWaveFreq: { value: 3.0 },    // 波紋頻率
+    uWaveSpeed:{ value: 1.2 },    // 波紋速度
+    uCol:      { value: new THREE.Color(0x6dc0d6) }
+  },
+  vertexShader: /* glsl */`
+    uniform float uTime, uWaveAmp, uWaveFreq, uWaveSpeed;
+    varying vec2 vUv;
+    void main(){
+      vUv = uv;
+      vec3 pos = position;
+      // 用 x,z 做簡單正弦波位移
+      pos.y += sin(pos.x * uWaveFreq + uTime * uWaveSpeed) * uWaveAmp;
+      pos.y += cos(pos.z * uWaveFreq * 0.7 + uTime * uWaveSpeed * 1.1) * uWaveAmp * 0.6;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+    }
+  `,
+  fragmentShader: /* glsl */`
+    uniform vec3 uCol;
+    varying vec2 vUv;
+    void main(){
+      // 簡單水色 + UV 線性漸變增加層次
+      float wave = 0.5 + 0.5*sin(vUv.x*20.0 + vUv.y*15.0);
+      vec3 col = uCol * (0.9 + 0.1*wave);
+      gl_FragColor = vec4(col, 0.85); // 保持透明度
+    }
+  `,
+  transparent: true
+});
+
+const water = new THREE.Mesh(waterGeo, waterMat);
+water.position.set(
+  0,
+  groundMat.uniforms.uRiverBase.value * groundMat.uniforms.uAmp.value * groundMat.uniforms.uGrow.value + 0.02,
+  0
+);
+water.receiveShadow = true;
+scene.add(water);
+
+
+      // -----------------------
+      // 5) Resize & Animate
+      // -----------------------
+      window.addEventListener("resize", () => {
+        const w = window.innerWidth, h = window.innerHeight;
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+        renderer.setSize(w, h);
+      });
+
+      function animate(){
+        controls.update();
+        renderer.render(scene, camera);
+        requestAnimationFrame(animate);
+        function animate(){
+  controls.update();
+  waterMat.uniforms.uTime.value = performance.now() / 1000.0; // 秒數
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+
+      }
+      animate();
+
+      // 可調提醒：
+      //  ‣ groundMat.uniforms.uFogDensity.value = 0.00004~0.00012 調整你想要的淡霧量
+      //  ‣ scene.fog.density = 0.0015~0.003 可同步嘗試
+    </script>
+  </body>
+</html>

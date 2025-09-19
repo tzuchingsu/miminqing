@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>화산 속 떠있는 녹아내리는 하트</title>
+    <link rel="icon" href="data:," />
+    <style>
+      :root { color-scheme: dark; }
+      html, body { height: 100%; }
+      body {
+        margin: 0;
+        background: #0b0b0f; /* 初始深色 */
+        color: #e6e8ef;
+        overflow: hidden;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      }
+      #hud {
+        position: fixed; left: 12px; top: 10px; font-size: 12px;
+        opacity: 0.8; user-select: none; pointer-events: none;
+      }
+    </style>
+
+    <!-- Three.js ES Modules -->
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="hud">화산 배경 · 중앙의 녹아내리는 하트 · 마우스로 회전 / 휠로 줌</div>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+      import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+
+      // ========== 1) Renderer ==========
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.0;
+      document.body.appendChild(renderer.domElement);
+
+      // ========== 2) Scene / Camera / Controls ==========
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 200);
+      camera.position.set(0, 0.6, 3.2);
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+
+      // 氣氛：紅黑霧
+      scene.fog = new THREE.FogExp2(0x190a0a, 0.18);
+
+      // ========== 3) Lighting ==========
+      scene.add(new THREE.AmbientLight(0xff4a1a, 0.15)); // 熔岩環境紅光
+      const key = new THREE.DirectionalLight(0xffe6b0, 0.9); // 熱光主光
+      key.position.set(1.5, 2.5, 1.0);
+      scene.add(key);
+
+      // 下方熔岩光像「火海」的泛光
+      const lavaLight = new THREE.PointLight(0xff5a1a, 3.5, 7.5, 2.0);
+      lavaLight.position.set(0, -0.3, 0);
+      scene.add(lavaLight);
+
+      // ========== 4) PMREM 環境（給物理材質做反射/折射） ==========
+      {
+        const pmrem = new THREE.PMREMGenerator(renderer);
+        scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.04).texture;
+        pmrem.dispose();
+      }
+
+      // ========== 5) 程式化「火山背景」 ==========
+      // 5-1) 天空半球：紅黑漸層
+      const skyGeo = new THREE.SphereGeometry(60, 64, 64);
+      const skyMat = new THREE.ShaderMaterial({
+        side: THREE.BackSide,
+        uniforms: {
+          topColor:   { value: new THREE.Color(0x1a0b0b) },
+          midColor:   { value: new THREE.Color(0x2a0c0c) },
+          glowColor:  { value: new THREE.Color(0x5a1a10) }
+        },
+        vertexShader: `
+          varying vec3 vPos;
+          void main(){
+            vPos = position;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: `
+          varying vec3 vPos;
+          uniform vec3 topColor, midColor, glowColor;
+          void main(){
+            float h = normalize(vPos).y * 0.5 + 0.5;
+            vec3 c = mix(midColor, topColor, smoothstep(0.0, 1.0, h));
+            // 地平線泛紅
+            c = mix(c, glowColor, smoothstep(0.2, 0.0, h));
+            gl_FragColor = vec4(c, 1.0);
+          }
+        `
+      });
+      const sky = new THREE.Mesh(skyGeo, skyMat);
+      scene.add(sky);
+
+      // 5-2) 熔岩地板（著色器：流動的噪聲熔岩）
+      const lavaGeo = new THREE.CircleGeometry(30, 128);
+      lavaGeo.rotateX(-Math.PI / 2);
+      const lavaMat = new THREE.ShaderMaterial({
+        transparent: false,
+        uniforms: {
+          uTime: { value: 0 },
+          uColorA: { value: new THREE.Color(0x2a0907) }, // 深紅黑
+          uColorB: { value: new THREE.Color(0x911b0a) }, // 熔紅
+          uColorC: { value: new THREE.Color(0xffd66b) }  // 金黃高光
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          void main(){
+            vUv = uv * 6.0; // 平鋪熔岩
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: `
+          varying vec2 vUv;
+          uniform float uTime;
+          uniform vec3 uColorA, uColorB, uColorC;
+
+          // 簡易 hash/noise/fbm
+          float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7)))*43758.5453); }
+          float noise(vec2 p){
+            vec2 i = floor(p), f = fract(p);
+            float a = hash(i);
+            float b = hash(i + vec2(1.0, 0.0));
+            float c = hash(i + vec2(0.0, 1.0));
+            float d = hash(i + vec2(1.0, 1.0));
+            vec2 u = f*f*(3.0-2.0*f);
+            return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+          }
+          float fbm(vec2 p){
+            float v = 0.0, a = 0.5;
+            for(int i=0;i<5;i++){ v += a * noise(p); p *= 2.0; a *= 0.5; }
+            return v;
+          }
+
+          void main(){
+            vec2 p = vUv;
+            // 熔岩往外流動
+            p.x += uTime * 0.05;
+            p.y += sin(uTime*0.2)*0.1;
+            float n = fbm(p) + 0.35*fbm(p*2.5 + 3.14);
+
+            // 顏色映射：先深紅，再熔紅、最後金黃亮
+            vec3 col = mix(uColorA, uColorB, smoothstep(0.2, 0.8, n));
+            col = mix(col, uColorC, smoothstep(0.75, 0.95, n));
+
+            // 高亮邊發光感
+            float glow = smoothstep(0.88, 0.98, n);
+            col += glow * vec3(0.6, 0.45, 0.2);
+
+            gl_FragColor = vec4(col, 1.0);
+          }
+        `
+      });
+      const lava = new THREE.Mesh(lavaGeo, lavaMat);
+      lava.position.y = -0.35;
+      scene.add(lava);
+
+      // ========== 6) 立體愛心（Extrude） ==========
+      function makeHeartGeometry() {
+        const s = new THREE.Shape();
+        const x=0, y=0;
+        const w=0.45, top=0.35, bottom=-0.35;
+        s.moveTo(x+0.0, y+top);
+        s.bezierCurveTo(x+0.0, y+top+0.25, x-w, y+top+0.25, x-w, y+top);
+        s.bezierCurveTo(x-w, y+0.15, x-0.08, y-0.15, x+0.0, y+bottom);
+        s.bezierCurveTo(x+0.08, y-0.15, x+w, y+0.15, x+w, y+top);
+        s.bezierCurveTo(x+w, y+top+0.25, x+0.0, y+top+0.25, x+0.0, y+top);
+
+        const extrudeSettings = {
+          depth: 0.25,
+          bevelEnabled: true,
+          bevelSegments: 8,
+          steps: 1,
+          bevelSize: 0.05,
+          bevelThickness: 0.05,
+          curveSegments: 64
+        };
+        const g = new THREE.ExtrudeGeometry(s, extrudeSettings);
+        g.center();
+        g.scale(3.0, 3.0, 3.0);
+        g.computeVertexNormals();
+        return g;
+      }
+
+      const geom = makeHeartGeometry();
+
+      // 6-1) 物理「融化玻璃」材質
+      const mat = new THREE.MeshPhysicalMaterial({
+        color: 0xff5aa6,          // 外觀主色（粉紅熔化水晶）
+        metalness: 0.0,
+        roughness: 0.08,          // 稍有粗糙，讓高光不刺眼
+        transmission: 1.0,        // 透明+折射
+        thickness: 0.3,           // 內部光路
+        ior: 1.5,                 // 稍高折射率 → 水晶感
+        clearcoat: 1.0,
+        clearcoatRoughness: 0.03,
+        attenuationColor: new THREE.Color(0xff7dbb),
+        attenuationDistance: 0.9,
+        envMapIntensity: 1.2,
+        side: THREE.FrontSide
+      });
+
+      // 6-2) 融化效果：在頂點著色器注入「向下流動 + 表面起伏」
+      mat.onBeforeCompile = (shader) => {
+        shader.uniforms.uTime       = { value: 0 };
+        shader.uniforms.uMelt       = { value: 1.0 }; // 0~1 融化程度
+        shader.uniforms.uFlowSpeed  = { value: 0.7 }; // 流動速度
+        shader.uniforms.uJellyAmp   = { value: 0.03 }; // 表面抖動強度
+        shader.uniforms.uSag        = { value: 0.22 }; // 整體下垂量
+
+        mat.userData.shader = shader;
+
+        shader.vertexShader = shader.vertexShader
+          .replace(
+            "#include <common>",
+            `
+            #include <common>
+            uniform float uTime, uMelt, uFlowSpeed, uJellyAmp, uSag;
+
+            // 簡易 3D 噪聲
+            float hash(vec3 p){ return fract(sin(dot(p, vec3(127.1,311.7,74.7)))*43758.5453); }
+            float noise(vec3 p){
+              vec3 i = floor(p), f = fract(p);
+              float a = hash(i);
+              float b = hash(i + vec3(1,0,0));
+              float c = hash(i + vec3(0,1,0));
+              float d = hash(i + vec3(1,1,0));
+              float e = hash(i + vec3(0,0,1));
+              float g = hash(i + vec3(1,0,1));
+              float h = hash(i + vec3(0,1,1));
+              float k = hash(i + vec3(1,1,1));
+              vec3 u = f*f*(3.0-2.0*f);
+              return mix(
+                mix(mix(a,b,u.x), mix(c,d,u.x), u.y),
+                mix(mix(e,g,u.x), mix(h,k,u.x), u.y),
+                u.z
+              );
+            }
+            float fbm(vec3 p){
+              float v=0.0, amp=0.5;
+              for(int i=0;i<5;i++){ v+=amp*noise(p); p*=2.0; amp*=0.5; }
+              return v;
+            }
+            `
+          )
+          .replace(
+            "#include <begin_vertex>",
+            `
+            // 原始位置
+            vec3 transformed = vec3(position);
+
+            // 規範化位置，估計表面方向
+            vec3 n = normalize(position);
+
+            // ------------- 表面「果凍」微起伏 -------------
+            float tt = uTime * 1.0;
+            float wobble =
+              0.5 * sin(2.0 * n.x + tt * 0.9) +
+              0.5 * sin(2.3 * n.y - tt * 1.2) +
+              0.4 * sin(2.7 * n.z + tt * 0.7);
+            transformed += normal * (uJellyAmp * wobble);
+
+            // ------------- 融化向下流動 -------------
+            // 融化主要作用在「下半部」；頂端較穩定
+            float meltMask = smoothstep(0.2, -0.8, n.y); // 上0 下1
+            // 噪聲驅動的垂墜 + 局部鼓包（像流動的滴狀）
+            float flow = fbm(n * 2.5 + vec3(0.0, tt * uFlowSpeed, 0.0));
+            float drip = fbm(n * 6.0 + vec3(0.0, tt * (uFlowSpeed*1.6), 3.14));
+
+            // 下垂：沿 -Y 方向
+            transformed.y -= uMelt * meltMask * (uSag * (0.4 + 0.6 * flow));
+
+            // 局部鼓包：沿法線方向，讓表面有「融化凝結」的感覺
+            transformed += normal * (uMelt * 0.06 * meltMask * drip);
+            `
+          );
+      };
+
+      const heart = new THREE.Mesh(geom, mat);
+      scene.add(heart);
+
+      // ========== 7) 漂浮/旋轉/心跳動畫 ==========
+      const clock = new THREE.Clock();
+      function animate(){
+        const t = clock.getElapsedTime();
+        const dt = clock.getDelta();
+
+        // 更新著色器時間與熔岩
+        if (mat.userData.shader) {
+          mat.userData.shader.uniforms.uTime.value = t;
+        }
+        lavaMat.uniforms.uTime.value = t;
+
+        // 漂浮：上下微幅
+        heart.position.y = 0.25 + Math.sin(t * 0.9) * 0.07;
+
+        // 心跳：Squash & Stretch（保持體積感）
+        const a = 0.08, s = Math.sin(t * 1.8);
+        heart.scale.set(1.0 - 0.5 * a * s, 1.0 + a * s, 1.0 - 0.5 * a * s);
+
+        // 慢速旋轉，讓高光/折射變化
+        heart.rotation.y += 0.15 * dt;
+
+        controls.update();
+        renderer.render(scene, camera);
+        requestAnimationFrame(animate);
+      }
+      animate();
+
+      // ========== 8) Resize ==========
+      window.addEventListener("resize", () => {
+        const w = window.innerWidth, h = window.innerHeight;
+        renderer.setSize(w, h);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+      });
+    </script>
+  </body>
+</html>

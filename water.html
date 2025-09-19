@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <!-- 문서 메타/기본 설정 -->
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>투명 물방울</title>
+    <link rel="icon" href="data:," />
+
+    <style>
+      /* 전역 스타일 (다크 테마, 캔버스 풀 화면, HUD 텍스트 등) */
+      :root {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        background: #0b1320; /* HDR 로딩 전 임시 배경 */
+        color: #e6e8ef;
+        overflow: hidden;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
+          Helvetica, Arial;
+      }
+      #hud {
+        position: fixed;
+        left: 12px;
+        top: 10px;
+        font-size: 12px;
+        opacity: 0.8;
+        user-select: none;
+        pointer-events: none;
+      }
+    </style>
+
+    <!-- Three.js 모듈 CDN 매핑 (주의: JSON이라 주석 넣으면 안 됨) -->
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+
+  <body>
+    <!-- 화면 안내 텍스트 -->
+    <div id="hud">마우스로 회전 · 휠로 줌</div>
+
+    <script type="module">
+      /* ===== 1) 모듈 임포트 ===== */
+      import * as THREE from "three";
+      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+      import { RGBELoader } from "three/addons/loaders/RGBELoader.js";
+      import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+
+      /* ===== 2) 환경(HDRI) 소스 설정 =====
+         - 구름 가득한 몽환 하늘(Pure Sky) HDR.
+         - 성공 시: scene.background & scene.environment 적용
+         - 실패 시: 실내 RoomEnvironment로 폴백
+      */
+      const ENV_URL =
+        "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/8k/spaichingen_hill_8k.hdr";
+
+      /* ===== 3) 렌더러 구성 =====
+         - 안티앨리어싱, 해상도 스케일, 색공간/톤매핑 설정
+         - 캔버스를 body에 부착
+      */
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.0;
+      document.body.appendChild(renderer.domElement);
+
+      /* ===== 4) 씬 & 카메라 =====
+         - 원근 카메라(시야각 45도)
+         - 시작 위치 살짝 뒤로
+      */
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        100
+      );
+      camera.position.set(0, 0.15, 3);
+
+      /* ===== 5) 컨트롤 =====
+         - 마우스 드래그/휠 줌을 위한 OrbitControls
+      */
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+
+      /* ===== 6) 공통 초기화 함수 start() =====
+         - 조명 추가(형태 식별용 보조광)
+         - 물방울 메시 생성(지오메트리+피지컬 머티리얼)
+         - 표면 잔물결(버텍스 변위) 추가
+         - 애니메이션 루프 시작
+         - 리사이즈 대응
+      */
+      function start() {
+        // 6-1) 라이트
+        scene.add(new THREE.AmbientLight(0xffffff, 0.2));
+        const key = new THREE.DirectionalLight(0xffffff, 0.6);
+        key.position.set(2, 3, 1);
+        scene.add(key);
+
+        // 6-2) 지오메트리(구) — 세분 96로 적당히 부드럽고 가벼움
+        // ===== 愛心形狀定義 =====
+// 6-2) 지오메트리 ====> 圓潤立體愛心
+const heartShape = new THREE.Shape();
+{
+  const x = 0, y = 0;
+
+  // === 愛心形狀控制點 ===
+  const w = 0.45;      // 左右半寬（越大越胖）
+  const top = 0.35;    // 上方高度（越大越高）
+  const bottom = -0.2;// 下方尖端高度（越小越長）
+
+  // 從愛心頂部中心開始，逆時針畫一圈
+  heartShape.moveTo(x + 0.0, y + top);
+
+  // 左上弧線（讓上半圓更圓潤）
+  heartShape.bezierCurveTo(
+    x + 0.0, y + top + 0.25,
+    x - w,  y + top + 0.25,
+    x - w,  y + top
+  );
+
+  // 左側 → 下尖端
+  heartShape.bezierCurveTo(
+    x - w,  y + 0.15,
+    x - 0.08, y - 0.15,
+    x + 0.0, y + bottom
+  );
+
+  // 右側 → 回到右上
+  heartShape.bezierCurveTo(
+    x + 0.08, y - 0.15,
+    x + w,  y + 0.15,
+    x + w,  y + top
+  );
+
+  // 右上弧線收回頂部
+  heartShape.bezierCurveTo(
+    x + w,  y + top + 0.25,
+    x + 0.0, y + top + 0.25,
+    x + 0.0, y + top
+  );
+}
+
+// === 擠出設定（Extrude） ===
+const extrudeSettings = {
+  depth: 0.3,          // 愛心厚度
+  bevelEnabled: true,   // 開啟圓角
+  bevelSegments: 20,     // 圓角平滑度
+  steps: 1,             // 擠出步數
+  bevelSize: 0.07,      // 圓角大小
+  bevelThickness: 0.05, // 圓角厚度
+  curveSegments: 100     // 曲線細分數（越大越平滑）
+};
+
+// === 建立立體愛心幾何 ===
+const geom = new THREE.ExtrudeGeometry(heartShape, extrudeSettings);
+
+// 幾何後處理：置中 + 放大
+geom.center();               // 置中
+geom.computeVertexNormals(); // 計算法線，對透明折射非常重要
+
+
+        // 6-3) 머티리얼 — MeshPhysicalMaterial의 transmission으로 ‘진짜 투명’
+        const mat = new THREE.MeshPhysicalMaterial({
+          color: 0xff69b4,
+          metalness: 0.0,
+          roughness: 0.05,
+          transmission: 1.0, // 투과(굴절) 활성화
+          thickness: 0.2, // 내부 경로 길이(투명감/굴절감 튜닝)
+          ior: 1.33, // 물의 굴절률
+          clearcoat: 1.0,
+          clearcoatRoughness: 0.02,
+          attenuationColor: new THREE.Color(0xffffff),
+          attenuationDistance: 100,
+          envMapIntensity: 1.5,
+        });
+
+        // 6-4) 표면 잔물결 — onBeforeCompile로 버텍스 셰이더에 시간 기반 변위 주입
+        mat.onBeforeCompile = (shader) => {
+          shader.uniforms.uTime = { value: 0 };
+          mat.userData.shader = shader;
+          shader.vertexShader = shader.vertexShader
+            .replace(
+              "#include <common>",
+              `
+              #include <common>
+              uniform float uTime; /* 시간 유니폼(애니메이션용) */
+            `
+            )
+            .replace(
+              "#include <begin_vertex>",
+              `
+              /* 기본 위치 */
+              vec3 transformed = vec3(position);
+
+              /* 구체 기준 법선 방향(대략 표면 방향) */
+              vec3 n = normalize(position);
+
+              /* 다중 사인파를 합쳐 잔물결 생성 */
+              float f = 0.0;
+f += sin(3.0 * n.x + uTime * 1.20);
+f += sin(4.0 * n.y - uTime * 0.95);
+f += sin(5.0 * n.z + uTime * 1.45);
+f /= 3.0;
+
+/* 新增心跳調制 */
+float beat = 0.7 + 0.6 * pow(max(0.0, sin(uTime * 3.0)), 3.0);
+f *= beat;
+
+              /* 법선 방향으로 소량 변위(울렁임) */
+              float amp = 0.05;
+              transformed += normal * (amp * f);
+            `
+            );
+        };
+
+        // 6-5) 메시 구성 후 씬에 추가
+        const droplet = new THREE.Mesh(geom, mat);
+        scene.add(droplet);
+
+        // 6-6) 애니메이션 루프
+        const clock = new THREE.Clock();
+        function animate() {
+          const t = clock.getElapsedTime();
+
+          // 셰이더 시간 업데이트(잔물결 애니메이션)
+          if (mat.userData.shader) mat.userData.shader.uniforms.uTime.value = t;
+
+          // 스쿼시 & 스트레치(볼륨 유지 느낌)
+          const a = 0.12,
+            s = Math.sin(t * 1.5);
+          droplet.scale.set(1.0 - 0.5 * a * s, 1.0 + a * s, 1.0 - 0.5 * a * s);
+
+          // 천천히 회전하여 하이라이트가 돌게
+          droplet.rotation.y += 0.15 * clock.getDelta();
+
+          controls.update();
+          renderer.render(scene, camera);
+          requestAnimationFrame(animate);
+        }
+        animate();
+
+        // 6-7) 리사이즈 대응
+        window.addEventListener("resize", () => {
+          const w = window.innerWidth,
+            h = window.innerHeight;
+          renderer.setSize(w, h);
+          camera.aspect = w / h;
+          camera.updateProjectionMatrix();
+        });
+      }
+
+      /* ===== 7) HDRI 로드 & 적용 (PMREM) =====
+         - RGBELoader로 equirectangular HDR 불러오기
+         - PMREM으로 선명한 조명/반사를 위한 prefilter 생성 → scene.environment
+         - 배경은 원본 HDR을 그대로 사용 → scene.background
+         - 실패 시 RoomEnvironment로 깔끔하게 폴백
+      */
+      new RGBELoader().load(
+        ENV_URL,
+        (hdr) => {
+          const pmrem = new THREE.PMREMGenerator(renderer);
+          hdr.mapping = THREE.EquirectangularReflectionMapping;
+
+          // 환경맵(조명/반사/굴절용)은 PMREM 결과 사용
+          const envRT = pmrem.fromEquirectangular(hdr);
+          scene.environment = envRT.texture;
+
+          // 배경은 HDR 원본을 그대로(구름 텍스처 선명)
+          scene.background = hdr;
+
+          // 정리 후 본격 시작
+          hdr.dispose();
+          pmrem.dispose();
+          start();
+        },
+        undefined,
+        () => {
+          // 네트워크/보안 이슈 등으로 HDR 실패 → 실내 환경으로 대체
+          const pmrem = new THREE.PMREMGenerator(renderer);
+          scene.environment = pmrem.fromScene(
+            new RoomEnvironment(renderer),
+            0.04
+          ).texture;
+          scene.background = null; // 배경은 단색(body 배경색)
+          pmrem.dispose();
+          start();
+        }
+      );
+    </script>
+  </body>
+</html>
