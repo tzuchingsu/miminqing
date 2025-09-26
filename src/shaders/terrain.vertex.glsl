@@ -12,6 +12,7 @@ uniform float uRiverWidth, uRiverFeather, uRiverBase;
 varying vec3  vWorldPos;
 varying float vH;
 varying float vRiverMask;
+varying vec2 vUv;
 
 vec3 mod289(vec3 x){ return x - floor(x * (1.0/289.0)) * 289.0; }
 vec2 mod289(vec2 x){ return x - floor(x * (1.0/289.0)) * 289.0; }
@@ -86,6 +87,8 @@ float riverMask(vec2 pNoise){
 }
 
 void main(){
+
+    vUv = uv;
   vec3 pos = position;
   vec2 pWorld = pos.xz;
   vec2 pNoise = pWorld * uScale;

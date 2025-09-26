@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Canyon (原地形) + 生態分佈圖</title>
+    <style>
+      html, body { height: 100%; margin: 0; }
+      body { overflow: hidden; background: #ffffff; }
+      canvas { display: block; }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/examples/jsm/controls/OrbitControls": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
+
+      // -----------------------
+      // 1) Renderer / Scene / Camera
+      // -----------------------
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setClearColor(0xffffff, 1);
+      renderer.shadowMap.enabled = true;
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      document.body.appendChild(renderer.domElement);
+
+      const scene = new THREE.Scene();
+      scene.fog = new THREE.FogExp2(0xffffff, 0.002);
+
+      const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+      camera.position.set(22, 18, 22);
+      camera.lookAt(0, 0, 0);
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+
+      // -----------------------
+      // 2) Lights
+      // -----------------------
+      const hemi = new THREE.HemisphereLight(0xffffff, 0x668899, 0.6);
+      hemi.position.set(0, 50, 0);
+      scene.add(hemi);
+
+      const dir = new THREE.DirectionalLight(0xffffff, 0.95);
+      dir.position.set(18, 28, 14);
+      dir.castShadow = true;
+      dir.shadow.mapSize.set(2048, 2048);
+      dir.shadow.camera.near = 0.5;
+      dir.shadow.camera.far = 120;
+      const s = 60;
+      dir.shadow.camera.left = -s; dir.shadow.camera.right = s;
+      dir.shadow.camera.top  =  s; dir.shadow.camera.bottom = -s;
+      scene.add(dir);
+
+      // -----------------------
+      // 3) Ground geometry (terrain) — 原本的 shader 地形
+      // -----------------------
+      const W = 140, H = 140, SEGX = 420, SEGY = 420;
+      const groundGeo = new THREE.PlaneGeometry(W, H, SEGX, SEGY);
+      groundGeo.rotateX(-Math.PI / 2);
+
+      const groundMat = new THREE.ShaderMaterial({
+        uniforms: {
+          // 基礎 fBm
+          uScale:        { value: 0.65 },
+          uAmp:          { value: 13.0 },
+          uOctaves:      { value: 7     },
+          uLacunarity:   { value: 2.0   },
+          uGain:         { value: 0.45  },
+          uGrow:         { value: 1.0   },
+
+          // A：Terrace fBm（HEIGHT）
+          uAScale:        { value: 0.20 },
+          uATerraceSteps: { value: 6.0  },
+
+          // B：OpenSimplex（MASK）
+          uBScale:    { value: 0.20 },
+          uBThreshLo: { value: 0.40 },
+          uBThreshHi: { value: 0.60 },
+
+          // 峽谷 & 河道
+          uRimGain:      { value: 0.20 },
+          uRiverWidth:   { value: 3.8  },
+          uRiverFeather: { value: 0.25 },
+          uRiverBase:    { value: -0.55 },
+
+          // 顏色 & 光
+          uColGrass:  { value: new THREE.Color(0x7bb66f) },
+          uColForest: { value: new THREE.Color(0x1f3a29) },
+          uColRock:   { value: new THREE.Color(0x2e4a3f) },
+          uColRiver:  { value: new THREE.Color(0x2a9ec2) },
+          uLightDir:  { value: new THREE.Vector3(0.6, 1.0, 0.5).normalize() },
+
+          // 霧（手動淡化用）
+          uFogDensity:   { value: 0.00008 }
+        },
+        vertexShader: /* glsl */`
+          precision highp float; precision highp int;
+          uniform float uScale, uAmp, uGrow;
+          uniform int   uOctaves;
+          uniform float uLacunarity, uGain;
+          uniform float uAScale, uATerraceSteps;
+          uniform float uBScale, uBThreshLo, uBThreshHi;
+          uniform float uRimGain;
+          uniform float uRiverWidth, uRiverFeather, uRiverBase;
+          varying vec3  vWorldPos; varying float vH; varying float vRiverMask;
+
+          vec3 mod289(vec3 x){ return x - floor(x*(1.0/289.0))*289.0; }
+          vec2 mod289(vec2 x){ return x - floor(x*(1.0/289.0))*289.0; }
+          vec3 permute(vec3 x){ return mod289(((x*34.0)+1.0)*x); }
+          float snoise(vec2 v){
+            const float C=0.211324865405187, F=0.366025403784439;
+            float s=(v.x+v.y)*F; vec2 i=floor(v+s);
+            float t=(i.x+i.y)*C; vec2 X0=i-t; vec2 x0=v-X0;
+            vec2 i1=(x0.x>x0.y)?vec2(1.0,0.0):vec2(0.0,1.0);
+            vec2 x1=x0-i1+C; vec2 x2=x0-1.0+2.0*C;
+            i=mod289(i);
+            vec3 p=permute( permute(i.y+vec3(0.0,i1.y,1.0)) + i.x+vec3(0.0,i1.x,1.0));
+            vec3 x=fract(p*(1.0/41.0))*2.0-1.0; vec3 h=abs(x)-0.5; vec3 ox=floor(x+0.5);
+            vec3 a0=x-ox; vec2 g0=vec2(a0.x,h.x), g1=vec2(a0.y,h.y), g2=vec2(a0.z,h.z);
+            vec3 w=max(0.5-vec3(dot(x0,x0),dot(x1,x1),dot(x2,x2)),0.0); vec3 w4=w*w*w*w;
+            float n0=dot(g0,x0), n1=dot(g1,x1), n2=dot(g2,x2);
+            return 40.0 * dot(w4, vec3(n0,n1,n2));
+          }
+          float fbm_simple(vec2 p, int oct, float lac, float gain){
+            float n=0.0,a=0.5,f=1.0; for(int o=0;o<12;o++){ if(o>=oct) break; n+=snoise(p*f)*a; f*=lac; a*=gain; }
+            return clamp(n,-1.0,1.0);
+          }
+          float terrace(float h, float steps){
+            float s=max(2.0,steps); float u=0.5*h+0.5; float t=floor(u*s)/s; return t*2.0-1.0;
+          }
+          float genA(vec2 p){ return terrace(fbm_simple(p, uOctaves, uLacunarity, uGain), uATerraceSteps); }
+          float genB(vec2 p){ float n=snoise(p); float m=0.5*n+0.5; return smoothstep(uBThreshLo,uBThreshHi,m); }
+          float riverMask(vec2 p){
+            float a=abs(p.x);
+            float edge=1.0 - smoothstep(uRiverWidth, uRiverWidth + uRiverFeather, a);
+            return pow(edge, 2.0);
+          }
+          void main(){
+            vec3 pos = position;
+            vec2 pN = pos.xz * uScale;
+            float A = genA(pN * uAScale);
+            float B = genB(pN * uBScale);
+            float h = A + uRimGain * B;
+            float mRiver = riverMask(pN);
+            h = mix(h, uRiverBase, mRiver);
+            pos.y += h * uAmp * uGrow;
+
+            vH = h; vRiverMask = mRiver;
+            vec4 wp = modelMatrix * vec4(pos,1.0);
+            vWorldPos = wp.xyz;
+            gl_Position = projectionMatrix * viewMatrix * wp;
+          }
+        `,
+        fragmentShader: /* glsl */`
+          precision highp float; precision highp int;
+          uniform vec3  uLightDir;
+          uniform float uScale, uAmp, uGrow;
+          uniform int   uOctaves;
+          uniform float uLacunarity, uGain;
+          uniform float uAScale, uATerraceSteps;
+          uniform float uBScale, uBThreshLo, uBThreshHi;
+          uniform float uRimGain;
+          uniform float uRiverWidth, uRiverFeather, uRiverBase;
+          uniform vec3  uColGrass, uColForest, uColRock, uColRiver;
+          uniform float uFogDensity;
+          varying vec3  vWorldPos; varying float vH; varying float vRiverMask;
+
+          // 法線近似（與頂點路徑一致）
+          vec3 mod289_vec3(vec3 x){ return x - floor(x*(1.0/289.0))*289.0; }
+          vec2 mod289_vec2(vec2 x){ return x - floor(x*(1.0/289.0))*289.0; }
+          vec3 permute_vec3(vec3 x){ return mod289_vec3(((x*34.0)+1.0)*x); }
+          float snoise2(vec2 v){
+            const float C=0.211324865405187, F=0.366025403784439;
+            float s=(v.x+v.y)*F; vec2 i=floor(v+s);
+            float t=(i.x+i.y)*C; vec2 X0=i-t; vec2 x0=v-X0;
+            vec2 i1=(x0.x>x0.y)?vec2(1.0,0.0):vec2(0.0,1.0);
+            vec2 x1=x0-i1+C; vec2 x2=x0-1.0+2.0*C;
+            i=mod289_vec2(i);
+            vec3 p=permute_vec3( permute_vec3(i.y+vec3(0.0,i1.y,1.0)) + i.x+vec3(0.0,i1.x,1.0));
+            vec3 x=fract(p*(1.0/41.0))*2.0-1.0; vec3 h=abs(x)-0.5; vec3 ox=floor(x+0.5);
+            vec3 a0=x-ox; vec2 g0=vec2(a0.x,h.x), g1=vec2(a0.y,h.y), g2=vec2(a0.z,h.z);
+            vec3 w=max(0.5-vec3(dot(x0,x0),dot(x1,x1),dot(x2,x2)),0.0); vec3 w4=w*w*w*w;
+            float n0=dot(g0,x0), n1=dot(g1,x1), n2=dot(g2,x2);
+            return 40.0 * dot(w4, vec3(n0,n1,n2));
+          }
+          float fbm2(vec2 p, int oct, float lac, float gain){
+            float n=0.0,a=0.5,f=1.0; for(int o=0;o<12;o++){ if(o>=oct) break; n+=snoise2(p*f)*a; f*=lac; a*=gain; }
+            return clamp(n,-1.0,1.0);
+          }
+          float terrace2(float h, float steps){ float s=max(2.0,steps); float u=0.5*h+0.5; float t=floor(u*s)/s; return t*2.0-1.0; }
+          float genA2(vec2 p){ return terrace2(fbm2(p, uOctaves, uLacunarity, uGain), uATerraceSteps); }
+          float genB2(vec2 p){ float n=snoise2(p); float m=0.5*n+0.5; return smoothstep(uBThreshLo,uBThreshHi,m); }
+          float riverMask2(vec2 p){
+            float a=abs(p.x);
+            float edge=1.0 - smoothstep(uRiverWidth, uRiverWidth + uRiverFeather, a);
+            return pow(edge, 2.0);
+          }
+          vec3 calcNormal(vec2 wxz){
+            float eps=0.35;
+            vec2 p0=wxz*uScale;
+            float H0 = mix(genA2(p0*uAScale)+uRimGain*genB2(p0*uBScale), uRiverBase, riverMask2(p0)) * uAmp * uGrow;
+            vec2 px=(wxz+vec2(eps,0.0))*uScale;
+            float HX = mix(genA2(px*uAScale)+uRimGain*genB2(px*uBScale), uRiverBase, riverMask2(px)) * uAmp * uGrow;
+            vec2 pz=(wxz+vec2(0.0,eps))*uScale;
+            float HZ = mix(genA2(pz*uAScale)+uRimGain*genB2(pz*uBScale), uRiverBase, riverMask2(pz)) * uAmp * uGrow;
+            vec3 dX=vec3(eps,HX-H0,0.0);
+            vec3 dZ=vec3(0.0,HZ-H0,eps);
+            return normalize(cross(dZ,dX));
+          }
+
+          void main(){
+            float h01 = clamp(0.5*(vH + 1.0), 0.0, 1.0);
+            float forestMask = genB2(vWorldPos.xz * uScale * uBScale);
+            vec3 groundCol = mix(uColGrass, uColRock, smoothstep(0.45, 0.75, h01));
+            groundCol = mix(groundCol, uColForest, forestMask * 0.6);
+            vec3 baseCol = mix(groundCol, uColRiver, vRiverMask);
+
+            vec3 N = calcNormal(vWorldPos.xz);
+            float diff = clamp(dot(N, normalize(uLightDir)), 0.0, 1.0);
+            float ambient = 0.70;
+            vec3 col = baseCol * (ambient + (1.0 - ambient) * diff);
+
+            float dist = length(vWorldPos.xz);
+            float fogFactor = 1.0 - exp(-uFogDensity * dist * dist);
+            col = mix(col, vec3(1.0), fogFactor);
+            gl_FragColor = vec4(col, 1.0);
+          }
+        `,
+        side: THREE.FrontSide
+      });
+
+      const ground = new THREE.Mesh(groundGeo, groundMat);
+      ground.castShadow = true;
+      ground.receiveShadow = true;
+      scene.add(ground);
+
+      // 深度材質位移對齊（陰影不飄）
+      const depthMat = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
+      depthMat.onBeforeCompile = (shader)=>{
+        shader.uniforms.uScale        = groundMat.uniforms.uScale;
+        shader.uniforms.uAmp          = groundMat.uniforms.uAmp;
+        shader.uniforms.uGrow         = groundMat.uniforms.uGrow;
+        shader.uniforms.uOctaves      = groundMat.uniforms.uOctaves;
+        shader.uniforms.uLacunarity   = groundMat.uniforms.uLacunarity;
+        shader.uniforms.uGain         = groundMat.uniforms.uGain;
+        shader.uniforms.uAScale       = groundMat.uniforms.uAScale;
+        shader.uniforms.uATerraceSteps= groundMat.uniforms.uATerraceSteps;
+        shader.uniforms.uBScale       = groundMat.uniforms.uBScale;
+        shader.uniforms.uBThreshLo    = groundMat.uniforms.uBThreshLo;
+        shader.uniforms.uBThreshHi    = groundMat.uniforms.uBThreshHi;
+        shader.uniforms.uRimGain      = groundMat.uniforms.uRimGain;
+        shader.uniforms.uRiverWidth   = groundMat.uniforms.uRiverWidth;
+        shader.uniforms.uRiverFeather = groundMat.uniforms.uRiverFeather;
+        shader.uniforms.uRiverBase    = groundMat.uniforms.uRiverBase;
+
+        shader.vertexShader = shader.vertexShader.replace(
+          '#include <begin_vertex>',
+          `#include <begin_vertex>
+           vec2 pN = (vec3(transformed).xz) * uScale;
+           float A = fbm(pN*uAScale, uOctaves, uLacunarity, uGain);
+           A = terrace(A, uATerraceSteps);
+           float B = genB(pN * uBScale);
+           float h = mix(A + uRimGain*B, uRiverBase, riverMask(pN));
+           transformed.y += h * uAmp * uGrow;`
+        ).replace('#include <common>', `#include <common>
+           uniform float uScale, uAmp, uGrow;
+           uniform int   uOctaves;
+           uniform float uLacunarity, uGain;
+           uniform float uAScale, uATerraceSteps;
+           uniform float uBScale, uBThreshLo, uBThreshHi;
+           uniform float uRimGain;
+           uniform float uRiverWidth, uRiverFeather, uRiverBase;
+           vec3 mod289(vec3 x){ return x - floor(x*(1.0/289.0))*289.0; }
+           vec2 mod289(vec2 x){ return x - floor(x*(1.0/289.0))*289.0; }
+           vec3 permute(vec3 x){ return mod289(((x*34.0)+1.0)*x); }
+           float snoise(vec2 v){
+             const float C=0.211324865405187, F=0.366025403784439;
+             float s=(v.x+v.y)*F; vec2 i=floor(v+s);
+             float t=(i.x+i.y)*C; vec2 X0=i-t; vec2 x0=v-X0;
+             vec2 i1=(x0.x>x0.y)?vec2(1.0,0.0):vec2(0.0,1.0);
+             vec2 x1=x0-i1+C; vec2 x2=x0-1.0+2.0*C;
+             i=mod289(i); vec3 p=permute( permute(i.y+vec3(0.0,i1.y,1.0)) + i.x+vec3(0.0,i1.x,1.0));
+             vec3 x=fract(p*(1.0/41.0))*2.0-1.0; vec3 h=abs(x)-0.5; vec3 ox=floor(x+0.5);
+             vec3 a0=x-ox; vec2 g0=vec2(a0.x,h.x), g1=vec2(a0.y,h.y), g2=vec2(a0.z,h.z);
+             vec3 w=max(0.5-vec3(dot(x0,x0),dot(x1,x1),dot(x2,x2)),0.0); vec3 w4=w*w*w*w;
+             float n0=dot(g0,x0), n1=dot(g1,x1), n2=dot(g2,x2);
+             return 40.0 * dot(w4, vec3(n0,n1,n2));
+           }
+           float fbm(vec2 p, int oct, float lac, float gain){ float n=0.0,a=0.5,f=1.0; for(int o=0;o<12;o++){ if(o>=oct) break; n+=snoise(p*f)*a; f*=lac; a*=gain; } return clamp(n,-1.0,1.0); }
+           float terrace(float h, float steps){ float s=max(2.0,steps); float u=0.5*h+0.5; float t=floor(u*s)/s; return t*2.0-1.0; }
+           float genB(vec2 p){ float n=snoise(p); float m=0.5*n+0.5; return smoothstep(uBThreshLo,uBThreshHi,m); }
+           float riverMask(vec2 p){ float a=abs(p.x); float edge=1.0 - smoothstep(uRiverWidth, uRiverWidth + uRiverFeather, a); return pow(edge, 2.0); }`
+        );
+      };
+      ground.customDepthMaterial = depthMat;
+
+      // -----------------------
+      // 4) River water plane（保留原本視覺）
+      // -----------------------
+      const riverWidthWorld = 2.0 * groundMat.uniforms.uRiverWidth.value / groundMat.uniforms.uScale.value;
+      const waterGeo = new THREE.PlaneGeometry(riverWidthWorld, H, 200, 200);
+      waterGeo.rotateX(-Math.PI / 2);
+      const waterMat = new THREE.ShaderMaterial({
+        uniforms: { uTime:{value:0.0}, uWaveAmp:{value:0.08}, uWaveFreq:{value:3.0}, uWaveSpeed:{value:1.2}, uCol:{value:new THREE.Color(0x6dc0d6)} },
+        vertexShader: `uniform float uTime,uWaveAmp,uWaveFreq,uWaveSpeed; varying vec2 vUv; void main(){ vUv=uv; vec3 p=position; p.y+=sin(p.x*uWaveFreq+uTime*uWaveSpeed)*uWaveAmp; p.y+=cos(p.z*uWaveFreq*0.7+uTime*uWaveSpeed*1.1)*uWaveAmp*0.6; gl_Position=projectionMatrix*modelViewMatrix*vec4(p,1.0); }`,
+        fragmentShader:`uniform vec3 uCol; varying vec2 vUv; void main(){ float w=0.5+0.5*sin(vUv.x*20.0+vUv.y*15.0); vec3 c=uCol*(0.9+0.1*w); gl_FragColor=vec4(c,0.85); }`,
+        transparent:true
+      });
+      const water = new THREE.Mesh(waterGeo, waterMat);
+      water.position.set(0, groundMat.uniforms.uRiverBase.value * groundMat.uniforms.uAmp.value * groundMat.uniforms.uGrow.value + 0.02, 0);
+      water.receiveShadow = true;
+      scene.add(water);
+
+      // ---------------------------------------------------
+      // 4.5) 生態分佈點（CPU 計算，貼合原地形）
+      // ---------------------------------------------------
+      // ---- 快速調整區 ----
+      const SAMPLE_RES = 220;           // 取樣解析度（越大越密）
+      const SIZE_BUTTERFLY = 2.5;       // 蝴蝶點大小（圓）
+      const SIZE_MOSS = 3.0;            // 苔癬點大小（方）
+      const BUTTERFLY_PROB = 0.22;      // 蝴蝶密度（0~1）
+      const MOSS_PROB = 0.24;           // 苔癬密度（0~1）
+      // --------------------
+
+      // GLSL -> JS：2D Simplex Noise（Gustavson 版）
+      function mod289(x){ return x - Math.floor(x * (1.0/289.0)) * 289.0; }
+      function permute(x){ return mod289(((x*34.0)+1.0)*x); }
+      function snoise2D(x, y){
+        const C = 0.211324865405187, F = 0.366025403784439;
+        const s = (x + y) * F;
+        const i = Math.floor(x + s);
+        const j = Math.floor(y + s);
+        const t = (i + j) * C;
+        const X0 = i - t, Y0 = j - t;
+        const x0 = x - X0, y0 = y - Y0;
+        const i1 = x0 > y0 ? 1 : 0, j1 = x0 > y0 ? 0 : 1;
+        const x1 = x0 - i1 + C, y1 = y0 - j1 + C;
+        const x2 = x0 - 1 + 2*C, y2 = y0 - 1 + 2*C;
+
+        let ii = mod289(i), jj = mod289(j);
+        const p0 = permute(ii + permute(jj));
+        const p1 = permute(ii + i1 + permute(jj + j1));
+        const p2 = permute(ii + 1  + permute(jj + 1 ));
+
+        function grad(p, x, y){
+          const fx = (p * (1/41.0)) % 1 * 2 - 1;
+          const h  = Math.abs(fx) - 0.5;
+          const ox = Math.floor(fx + 0.5);
+          const a0 = fx - ox;
+          const gx = a0, gy = h;
+          return gx * x + gy * y;
+        }
+
+        function w(x, y){ const t = 0.5 - x*x - y*y; return t < 0 ? 0 : t*t*t*t; }
+
+        const n0 = grad(p0, x0, y0) * w(x0, y0);
+        const n1 = grad(p1, x1, y1) * w(x1, y1);
+        const n2 = grad(p2, x2, y2) * w(x2, y2);
+
+        return 40.0 * (n0 + n1 + n2);
+      }
+
+      // 與 shader 一致的參數
+      const U = {
+        scale: groundMat.uniforms.uScale.value,
+        amp:   groundMat.uniforms.uAmp.value,
+        grow:  groundMat.uniforms.uGrow.value,
+        oct:   groundMat.uniforms.uOctaves.value,
+        lac:   groundMat.uniforms.uLacunarity.value,
+        gain:  groundMat.uniforms.uGain.value,
+        aScale:groundMat.uniforms.uAScale.value,
+        aSteps:groundMat.uniforms.uATerraceSteps.value,
+        bScale:groundMat.uniforms.uBScale.value,
+        bLo:   groundMat.uniforms.uBThreshLo.value,
+        bHi:   groundMat.uniforms.uBThreshHi.value,
+        rim:   groundMat.uniforms.uRimGain.value,
+        rW:    groundMat.uniforms.uRiverWidth.value,
+        rF:    groundMat.uniforms.uRiverFeather.value,
+        rBase: groundMat.uniforms.uRiverBase.value
+      };
+
+      function fbm(px, pz){
+        let n = 0, a = 0.5, f = 1.0;
+        for(let o=0;o<Math.min(U.oct,12);o++){
+          n += snoise2D(px*f, pz*f) * a;
+          f *= U.lac; a *= U.gain;
+        }
+        return Math.max(-1, Math.min(1, n));
+      }
+      function terrace(h, steps){
+        const s = Math.max(2.0, steps);
+        const u = 0.5*h + 0.5;
+        const t = Math.floor(u * s) / s;
+        return t*2.0 - 1.0;
+      }
+      function genA(px, pz){ return terrace(fbm(px, pz), U.aSteps); }
+      function genB(px, pz){
+        const n = snoise2D(px, pz);
+        const m = 0.5*n + 0.5;
+        const t = (m - U.bLo) / (U.bHi - U.bLo);
+        return Math.max(0, Math.min(1, t)) ** 1.0; // smoothstep 近似（線性已足夠）
+      }
+      function riverMask(px){
+        const a = Math.abs(px);
+        const edge = 1.0 - smoothstep(U.rW, U.rW + U.rF, a);
+        return Math.pow(edge, 2.0);
+      }
+      function smoothstep(edge0, edge1, x){
+        const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+        return t*t*(3 - 2*t);
+      }
+
+      // 高度（噪聲空間 -> 乘 amp/grow 得世界 y）
+      function terrainH_world(x, z){
+        const pN_x = x * U.scale;
+        const pN_z = z * U.scale;
+        const A = genA(pN_x * U.aScale, pN_z * U.aScale);
+        const B = genB(pN_x * U.bScale, pN_z * U.bScale);
+        const h = (1.0 - riverMask(pN_x)) * (A + U.rim * B) + riverMask(pN_x) * U.rBase;
+        return h * U.amp * U.grow;
+      }
+      function terrainH_noise(x, z){ // [-1,1]
+        const pN_x = x * U.scale, pN_z = z * U.scale;
+        const A = genA(pN_x * U.aScale, pN_z * U.aScale);
+        const B = genB(pN_x * U.bScale, pN_z * U.bScale);
+        return (1.0 - riverMask(pN_x)) * (A + U.rim * B) + riverMask(pN_x) * U.rBase;
+      }
+
+      // 法線/坡度/凹凸與朝向
+      function deriv(x, z){
+        const eps = 0.6;
+        const H0 = terrainH_world(x, z);
+        const HX = terrainH_world(x+eps, z);
+        const HZ = terrainH_world(x, z+eps);
+        const HXm= terrainH_world(x-eps, z);
+        const HZm= terrainH_world(x, z-eps);
+
+        const dX = new THREE.Vector3(eps, HX - H0, 0);
+        const dZ = new THREE.Vector3(0, HZ - H0, eps);
+        const N = dZ.cross(dX).normalize();
+
+        const lap = (HX + HXm + HZ + HZm - 4*H0); // >0 凹, <0 凸
+        return { N, lap, H0 };
+      }
+
+      // 生成分佈點
+      function makeCircleTexture(){
+        const c = document.createElement('canvas'); c.width = c.height = 64;
+        const ctx = c.getContext('2d');
+        // glow
+        const g = ctx.createRadialGradient(32,32,6, 32,32,28);
+        g.addColorStop(0, 'rgba(255,163,26,1)');
+        g.addColorStop(1, 'rgba(255,163,26,0)');
+        ctx.fillStyle = g; ctx.beginPath(); ctx.arc(32,32,28,0,Math.PI*2); ctx.fill();
+        // core
+        ctx.fillStyle = '#FFA31A'; ctx.beginPath(); ctx.arc(32,32,16,0,Math.PI*2); ctx.fill();
+        // outline
+        ctx.strokeStyle = 'rgba(0,0,0,0.85)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(32,32,18,0,Math.PI*2); ctx.stroke();
+        const tex = new THREE.CanvasTexture(c); tex.anisotropy = 4; tex.needsUpdate = true; return tex;
+      }
+      function makeSquareTexture(){
+        const c = document.createElement('canvas'); c.width = c.height = 64;
+        const ctx = c.getContext('2d');
+        // glow
+        const g = ctx.createLinearGradient(0,0,64,64);
+        g.addColorStop(0, 'rgba(73,166,255,0.9)');
+        g.addColorStop(1, 'rgba(73,166,255,0.0)');
+        ctx.fillStyle = g; ctx.fillRect(0,0,64,64);
+        // core
+        ctx.fillStyle = '#49A6FF'; ctx.fillRect(14,14,36,36);
+        // outline
+        ctx.strokeStyle = 'rgba(0,0,0,0.85)'; ctx.lineWidth = 2; ctx.strokeRect(12,12,40,40);
+        const tex = new THREE.CanvasTexture(c); tex.anisotropy = 4; tex.needsUpdate = true; return tex;
+      }
+
+      function makePoints(positions, texture, size){
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+        const m = new THREE.PointsMaterial({
+          size: size,
+          map: texture,
+          transparent: true,
+          depthTest: false,     // 壓在最上層
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+          sizeAttenuation: true
+        });
+        const pts = new THREE.Points(g, m);
+        pts.renderOrder = 9999;
+        return pts;
+      }
+
+      // 採樣整個地表
+      const mossPos = [];
+      const butterflyPos = [];
+      const circleTex = makeCircleTexture();
+      const squareTex = makeSquareTexture();
+
+      function rand(seed){ return (Math.sin(seed*127.1) * 43758.5453) % 1; }
+
+      for(let iy=0; iy<=SAMPLE_RES; iy++){
+        const z = -H/2 + (iy / SAMPLE_RES) * H;
+        for(let ix=0; ix<=SAMPLE_RES; ix++){
+          const x = -W/2 + (ix / SAMPLE_RES) * W;
+
+          const hNoise = terrainH_noise(x, z);         // [-1,1]
+          const yWorld = terrainH_world(x, z) + 0.03;  // 貼地 + 微浮避免閃爍
+          const { N, lap } = deriv(x, z);
+          const slope = 1 - Math.max(0, Math.min(1, N.y)); // 0=平 1=垂直
+          const north = new THREE.Vector2(N.x, N.z).normalize().dot(new THREE.Vector2(0,1));  // 北向
+          const south = new THREE.Vector2(N.x, N.z).normalize().dot(new THREE.Vector2(0,-1)); // 南向
+
+          // 條件權重
+          // 苔癬（藍方塊）: 中高度 × 陡坡 × 凹地 × 北向
+          const hMid = Math.max(0, 1 - Math.abs((0.5*(hNoise+1.0) - 0.55) / 0.28));
+          const steep = smoothstep(0.18, 0.55, slope);
+          const concv = smoothstep(0.00, 0.18, lap);
+          const northW= smoothstep(0.10, 0.45, north);
+          const mossScore = hMid * steep * concv * northW;
+
+          // 蝴蝶（橘圓點）: 低地 × 平地 × 凸起 × 南向
+          const low  = smoothstep(0.62, 0.12, 0.5*(hNoise+1.0));
+          const flat = smoothstep(0.22, 0.05, slope);
+          const convex = smoothstep(-0.22, -0.03, lap);
+          const southW = smoothstep(0.10, 0.45, south);
+          const butterflyScore = low * flat * convex * southW;
+
+          // 機率篩選（讓分布自然）
+          const seed = ix*73856093 ^ iy*19349663;
+          if (mossScore > 0.56 && Math.random() < MOSS_PROB){
+            mossPos.push(x, yWorld, z);
+          }
+          if (butterflyScore > 0.56 && Math.random() < BUTTERFLY_PROB){
+            butterflyPos.push(x, yWorld, z);
+          }
+        }
+      }
+
+      const moss = makePoints(mossPos, squareTex, SIZE_MOSS);
+      const butterflies = makePoints(butterflyPos, circleTex, SIZE_BUTTERFLY);
+      scene.add(moss);
+      scene.add(butterflies);
+
+      // -----------------------
+      // 5) Resize & Animate
+      // -----------------------
+      window.addEventListener("resize", () => {
+        const w = window.innerWidth, h = window.innerHeight;
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+        renderer.setSize(w, h);
+      });
+
+      function animate(){
+        controls.update();
+        renderer.render(scene, camera);
+        requestAnimationFrame(animate);
+      }
+      animate();
+
+      // 想即時微調（打開 DevTools Console）：
+      // butterflies.material.size = 5.0~7.0
+      // moss.material.size = 4.5~6.0
+      // 調整 SAMPLE_RES / *_PROB 以控制密度
+    </script>
+  </body>
+</html>

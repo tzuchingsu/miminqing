@@ -483,6 +483,7 @@ water.receiveShadow = true;
 scene.add(water);
 
 
+
       // -----------------------
       // 5) Resize & Animate
       // -----------------------
@@ -497,13 +498,7 @@ scene.add(water);
         controls.update();
         renderer.render(scene, camera);
         requestAnimationFrame(animate);
-        function animate(){
-  controls.update();
-  waterMat.uniforms.uTime.value = performance.now() / 1000.0; // 秒數
-  renderer.render(scene, camera);
-  requestAnimationFrame(animate);
-}
-
+        
       }
       animate();
 

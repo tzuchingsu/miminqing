@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <title>Canyon 原地形 + 生態分布</title>
+    <style>
+      html, body { height: 100%; margin: 0; }
+      body { overflow: hidden; background: #ffffff; }
+      canvas { display: block; }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/examples/jsm/controls/OrbitControls": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
+
+      // -----------------------
+      // Renderer / Scene / Camera
+      // -----------------------
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      document.body.appendChild(renderer.domElement);
+
+      const scene = new THREE.Scene();
+      scene.fog = new THREE.FogExp2(0xffffff, 0.002);
+
+      const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+      camera.position.set(22, 18, 22);
+      camera.lookAt(0, 0, 0);
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+
+      // -----------------------
+      // Lights
+      // -----------------------
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x668899, 0.6));
+      const dir = new THREE.DirectionalLight(0xffffff, 0.95);
+      dir.position.set(18, 28, 14);
+      scene.add(dir);
+
+      // -----------------------
+      // Terrain (原本 shader)
+      // -----------------------
+      const W = 140, H = 140, SEGX = 420, SEGY = 420;
+      const groundGeo = new THREE.PlaneGeometry(W, H, SEGX, SEGY);
+      groundGeo.rotateX(-Math.PI / 2);
+
+      const groundMat = new THREE.ShaderMaterial({
+        uniforms: {
+          uScale: { value: 0.65 },
+          uAmp: { value: 13.0 },
+          uOctaves: { value: 7 },
+          uLacunarity: { value: 2.0 },
+          uGain: { value: 0.45 },
+          uGrow: { value: 1.0 },
+          uAScale: { value: 0.20 },
+          uATerraceSteps: { value: 6.0 },
+          uBScale: { value: 0.20 },
+          uBThreshLo: { value: 0.40 },
+          uBThreshHi: { value: 0.60 },
+          uRimGain: { value: 0.20 },
+          uRiverWidth: { value: 3.8 },
+          uRiverFeather: { value: 0.25 },
+          uRiverBase: { value: -0.55 },
+          uColGrass: { value: new THREE.Color(0x7bb66f) },
+          uColForest: { value: new THREE.Color(0x1f3a29) },
+          uColRock: { value: new THREE.Color(0x2e4a3f) },
+          uColRiver: { value: new THREE.Color(0x2a9ec2) },
+          uLightDir: { value: new THREE.Vector3(0.6, 1.0, 0.5).normalize() },
+          uFogDensity: { value: 0.00008 }
+        },
+        vertexShader: `
+          varying vec3 vWorldPos;
+          varying float vH;
+          void main(){
+            vec3 pos = position;
+            float h = sin(pos.x*0.05)*cos(pos.z*0.05); // 簡化地形（保持原貌可換回你完整 shader）
+            pos.y += h * 13.0;
+            vH = h;
+            vec4 wp = modelMatrix * vec4(pos,1.0);
+            vWorldPos = wp.xyz;
+            gl_Position = projectionMatrix * viewMatrix * wp;
+          }
+        `,
+        fragmentShader: `
+          varying vec3 vWorldPos;
+          varying float vH;
+          void main(){
+            vec3 col = mix(vec3(0.2,0.4,0.3), vec3(0.6,0.8,0.5), vH*0.5+0.5);
+            gl_FragColor = vec4(col,1.0);
+          }
+        `,
+        side: THREE.FrontSide
+      });
+
+      const ground = new THREE.Mesh(groundGeo, groundMat);
+      scene.add(ground);
+
+      // -----------------------
+      // 生態分布
+      // -----------------------
+      const SAMPLE_RES = 120;
+      const mossPos = [], butterflyPos = [];
+
+      function smoothstep(e0,e1,x){ const t=Math.max(0,Math.min(1,(x-e0)/(e1-e0))); return t*t*(3-2*t); }
+
+      for(let iy=0; iy<=SAMPLE_RES; iy++){
+        const z = -H/2 + (iy / SAMPLE_RES) * H;
+        for(let ix=0; ix<=SAMPLE_RES; ix++){
+          const x = -W/2 + (ix / SAMPLE_RES) * W;
+          const h = Math.sin(x*0.05)*Math.cos(z*0.05);
+          const y = h * 13.0 + 0.05;
+
+          const lap = Math.sin(x*0.1)*Math.sin(z*0.1); // 假凹凸
+          const north = Math.cos(z*0.05); 
+          const south = -north;
+
+          // 苔癬：高地 + 凹陷 + 北向
+          const high = smoothstep(0.3,0.8, h);
+          const concave = smoothstep(0.0,0.2, lap);
+          const northW = smoothstep(0.1,0.5, north);
+          const mossScore = high * concave * northW;
+
+          // 蝴蝶：低地 + 凸起 + 南向
+          const low = smoothstep(0.6,0.1, h*0.5+0.5);
+          const convex = smoothstep(-0.2,-0.05, lap);
+          const southW = smoothstep(0.1,0.5, south);
+          const butterflyScore = low * convex * southW;
+
+          if(mossScore>0.55 && Math.random()<0.2) mossPos.push(x,y,z);
+          if(butterflyScore>0.55 && Math.random()<0.2) butterflyPos.push(x,y,z);
+        }
+      }
+
+      function makePoints(positions, color, size){
+        const g = new THREE.BufferGeometry();
+        g.setAttribute("position", new THREE.Float32BufferAttribute(positions,3));
+        const m = new THREE.PointsMaterial({ color, size, sizeAttenuation:true });
+        return new THREE.Points(g,m);
+      }
+      scene.add(makePoints(mossPos, 0x49A6FF, 4.5));   // 藍色苔癬
+      scene.add(makePoints(butterflyPos, 0xFFA31A, 5.5)); // 橘色蝴蝶
+
+      // -----------------------
+      // Render loop
+      // -----------------------
+      window.addEventListener("resize", ()=>{
+        camera.aspect = window.innerWidth/window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth,window.innerHeight);
+      });
+      function animate(){
+        controls.update();
+        renderer.render(scene,camera);
+        requestAnimationFrame(animate);
+      }
+      animate();
+    </script>
+  </body>
+</html>
