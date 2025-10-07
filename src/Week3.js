@@ -21,7 +21,7 @@ const controls = new OrbitControls(camera, renderer.domElement);
 // 4) GLB 불러오기
 const loader = new GLTFLoader();
 loader.load(
-  "./assets/models/cube.glb", // 🔹 학생마다 자기 GLB 경로 넣기
+  "./assets/models/newmi.glb", // 🔹 학생마다 자기 GLB 경로 넣기
   (gltf) => scene.add(gltf.scene),
   undefined,
   (err) => console.error("GLB load error:", err)
