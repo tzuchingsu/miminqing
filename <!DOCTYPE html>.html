@@ -1,286 +1,47 @@
 <!DOCTYPE html>
 <html lang="ko">
   <head>
-    <!-- HTML 보일러플레이트: 문서 정보 -->
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Boilerplate</title>
-
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>My Three.js Project</title>
+    <link rel="icon" href="data:," />
     <style>
+      :root {
+        color-scheme: dark;
+      }
       html,
       body {
         height: 100%;
-        margin: 0;
-      } /* 브라우저 화면 전체(html, body)를 100% 높이로 사용 */
-      body {
-        overflow: hidden; /* 스크롤바다 나타나지 않게 함 */
-        background: #ffffff; /* 배경색을 흰색으로 지정 */
       }
-      canvas {
-        display: block; /* 캔버스 주변 여백 없앰 */
+      body {
+        margin: 0;
+        background: #92ced8;
+        color: #e6e8ef;
+        overflow: hidden;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
+          Helvetica, Arial;
+      }
+      #hud {
+        position: fixed;
+        left: 12px;
+        top: 10px;
+        font-size: 12px;
+        opacity: 0.85;
       }
     </style>
-
-    <!-- 모듈 이름과 실제 파일 경로(URL)를 매핑해주는 설정표 -->
     <script type="importmap">
       {
         "imports": {
           "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-          "three/examples/jsm/controls/OrbitControls": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js"
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
         }
       }
     </script>
   </head>
-
   <body>
-    <!-- three.js 보일러플레이트 시작 -->
-    <!-- 위에서 정의한 importmap을 실제로 불러와서 사용하는 코드 -->
-    <script type="module">
-      import * as THREE from "three";
-      import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
+    <div id="hud">FPS 표시 · 단축키 안내</div>
 
-      // 1) Renderer
-      const renderer = new THREE.WebGLRenderer({ antialias: true });
-      // WebGLRenderer: 브라우저의 WebGL API를 이용해 3D 장면을 그려주는 엔진
-      // {anialias: true}: jagged edges를 줄이기 위한 안티앨리어싱 옵션
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // 화면 픽셀 비율을 맞춤
-      // 브라우저가 보고 있는 CSS 픽셀과 물리 픽셀 비율을 2(레티아 디스플레이)까지만 허용한다.
-      // 1(일반 모니터), 2(레티나 디스플레이), 3-(4K/8K...)
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      // 렌더러 캔버스의 크기를 브라우저 창 크기에 맞춘다.
-      renderer.setClearColor(0xffffff, 1);
-      // 배경을 흰색으로 지정하고, 투명도는 1(완전 불투명)
-      renderer.shadowMap.enabled = true;
-      // shadow 기능을 활성화 한다.
-      document.body.appendChild(renderer.domElement);
-      // three.js가 내부에서 만든 캔버스(renderer.domElement)를 HTML 문서에 추가해서, 실제로 화면에 3D 장면이 그려지도록 하는 코드.
-
-      // 2) Scene
-      const scene = new THREE.Scene();
-      // 3D 그래픽을 담을 stage 같은 공간 생성
-      // scened은 프로젝트에서 가장 상위 컨테이너 역할
-
-      // 3) Camera
-      const camera = new THREE.PerspectiveCamera(
-        60, // 시야각(FOV: field of view)
-        window.innerWidth / window.innerHeight, // aspect ration
-        0.1, // 가까운 클리핑 거리
-        1000 // 먼 클리핑 거리
-      );
-      camera.position.set(12, 10, 12);
-      camera.lookAt(0, 0, 0);
-
-      // 4) Controls (옵션)
-      const controls = new OrbitControls(camera, renderer.domElement);
-      // OrbitControls: three.js에서 제공하는 카메라 조작 도구
-      controls.enableDamping = true;
-      // 카메라 움직임이 "바로 딱 멈추지 않고" 관성(부드러운 감속) 효과를 주는 옵션
-      // 이걸 켜면 프레임마다 controls.update()도 호출해야 함
-
-      // 5) Lights
-      // 부드러운 전체광
-      const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.6);
-      // HemisphereLight: skyColor와 groundColor를 동시에 주는 반구광
-      // 자연광처럼 위쪽은 밝은색, 아래쪽은 어두운 색으로 표현할 때 적합
-      // (흰색, 짙은 회색, 세기)
-      hemi.position.set(0, 50, 0);
-      // 조명은 y축 60 위치에 둠
-      scene.add(hemi);
-      // 만든 조명을 Scene에 추가해서 실제로 빛이 적용됨
-
-      // 방향광 + 그림자
-      const dir = new THREE.DirectionalLight(0xffffff, 1.0);
-      // DirectionalLight: 멀리 있는 태양처럼, 한 방향에서 전체 장면에 고르게 빛을 쏘는 광원
-      // (흰색, 빛의 세기)
-      dir.position.set(10, 20, 10);
-      // 빛이 오는 방향을 설정.
-      dir.castShadow = true;
-      // 이 빛이 그림자를 만들도록 활성화
-      dir.shadow.mapSize.set(2048, 2048);
-      // 그림자 텍스처 해상도.
-      // 값이 클수록 그림자가 선명하지만, 성능 부담이 커진다. 2048×2048이면 꽤 고화질 그림자.
-      dir.shadow.camera.near = 0.5;
-      dir.shadow.camera.far = 100;
-      // 그림자를 계산할 카메라의 깊이 범위
-      const s = 60; // 그림자 카메라 범위
-      dir.shadow.camera.left = -s;
-      dir.shadow.camera.right = s;
-      dir.shadow.camera.top = s;
-      dir.shadow.camera.bottom = -s;
-      // 그림자 계산에 쓰이는 정사각형 카메라 영역 설정.
-      // 이 영역 안에 있는 물체만 그림자 렌더링.
-      // 너무 작으면 그림자가 잘리거나 안 보이고, 너무 크면 흐려짐.
-      scene.add(dir);
-      // Scene에 광원을 추가해 적용.
-
-      
-      // 6) Mesh: PlaneGeometry
-      const W = 100,
-        H = 100,
-        SEGX = 300,
-        SEGY = 300; // 지오메트리 해상도↑
-      const geo = new THREE.PlaneGeometry(W, H, SEGX, SEGY);
-      geo.rotateX(-Math.PI / 2);
-      const mat = new THREE.MeshStandardMaterial({
-        // MeshStandardMaterial: 물리 기반 렌러딩(PBR)용 머티리얼
-        color: 0xdddddd, // 연한 회색
-        roughness: 1.0, // 표면 거칠기
-        metalness: 0.0, // 금속성
-      });
-      const ground = new THREE.Mesh(geo, mat);
-      // Geometry+Material > Mesh 생성
-      // 실제로 scene에 보이는 "바닥" 오브젝트
-      ground.receiveShadow = true;
-      // 다른 오브젝트가 만든 그림자를 이 바닥이 받도록 설정
-      ground.castShadow = true;
-      scene.add(ground);
-      // 장면에 추가
-
-      /* 원본 정점 좌표 캐시: (x, y, z) 반복 */
-      const posAttr = geo.attributes.position;
-      const base = new Float32Array(posAttr.array.length);
-      base.set(posAttr.array);
-
-/* Simplex Noise */
-      /* [STEP 1] 정수 격자(integer lattice): 입력 좌표를 floor 해서 해당 칸과 주변 격자점을 기준으로 계산한다.*/
-      function latticeFloor(v) {
-        return Math.floor(v);
-      }
-
-      const G12 = Array.from({ length: 12 }, (_, i) => {
-        const th = (i / 12) * Math.PI * 2;
-        return [Math.cos(th), Math.sin(th)];
-      });
-
-      // 해시 함수 → 0..11
-      function hash2(i, j) {
-        let h = i * 374761393 + j * 668265263;
-        h = (h ^ (h >>> 13)) * 1274126177;
-        return ((h ^ (h >>> 16)) >>> 0) % 12;
-      }
-
-      const grad2 = (i, j) => G12[hash2(i, j)];
-      const dot2 = (a, b) => a[0] * b[0] + a[1] * b[1];
-
-      // Skew/Unskew 상수 (2D)
-      const F2 = 0.5 * (Math.sqrt(3) - 1); // 기울이기 계수
-      const G2 = (3 - Math.sqrt(3)) / 6; // 되돌리기 계수
-
-      // 2D Simplex noise
-      function simplex2D(x, y) {
-        // Skew: 정사각형 격자를 심플렉스 좌표계로 기울여서 "정수 셀"을 쉽게 찾음
-        const s = (x + y) * F2;
-        const i = Math.floor(x + s);
-        const j = Math.floor(y + s);
-
-        // Unskew: 다시 원래 좌표계로 복원 (셀의 원점 X0,Y0)
-        const t = (i + j) * G2;
-        const X0 = i - t,
-          Y0 = j - t;
-        const x0 = x - X0,
-          y0 = y - Y0; // 셀 내부 상대 좌표
-
-        // 어떤 삼각형 절반에 있는지: (1,0) or (0,1)
-        let i1, j1;
-        if (x0 > y0) {
-          i1 = 1;
-          j1 = 0;
-        } else {
-          i1 = 0;
-          j1 = 1;
-        }
-
-        // 세 코너까지의 상대 좌표
-        const x1 = x0 - i1 + G2; // 두 번째 코너
-        const y1 = y0 - j1 + G2; // 두 번째 코너
-        const x2 = x0 - 1 + 2 * G2; // 세 번째 코너
-        const y2 = y0 - 1 + 2 * G2; // 세 번째 코너
-
-        // 각 코너의 gradient
-        const g0 = grad2(i, j);
-        const g1 = grad2(i + i1, j + j1);
-        const g2v = grad2(i + 1, j + 1);
-
-        // 감쇄 커널 t^4 * (grad · dist)
-        let n0 = 0,
-          n1 = 0,
-          n2 = 0;
-
-        let tt0 = 0.5 - x0 * x0 - y0 * y0;
-        if (tt0 > 0) {
-          tt0 *= tt0;
-          n0 = tt0 * tt0 * dot2(g0, [x0, y0]);
-        }
-
-        let tt1 = 0.5 - x1 * x1 - y1 * y1;
-        if (tt1 > 0) {
-          tt1 *= tt1;
-          n1 = tt1 * tt1 * dot2(g1, [x1, y1]);
-        }
-
-        let tt2 = 0.5 - x2 * x2 - y2 * y2;
-        if (tt2 > 0) {
-          tt2 *= tt2;
-          n2 = tt2 * tt2 * dot2(g2v, [x2, y2]);
-        }
-
-        // 2D 정규화 상수(대략 70)를 곱해 [-1,1] 근방으로 스케일링
-        return 70.0 * (n0 + n1 + n2);
-    }
-          /*- fBm 함수 정의하기 -*/
-      function fbm2D(x, y, octaves = 5, lacunarity = 2.0, gain = 0.5) {
-        let n = 0;
-        let freq = 1.0;
-        let amp = 0.5;
-
-        for (let o = 0; o < octaves; o++) {
-          n += simplex2D(x * freq, y * freq) * amp;
-          freq *= lacunarity; // 주파수 점점 증가
-          amp *= gain; // 진폭 점점 감소
-        }
-
-        return n;
-      }
-
-      // 7) Resize handler
-      window.addEventListener("resize", () => {
-        // 브라우저 창 크기가 변경될 때마다 안쪽 함수를 실행.
-        const w = window.innerWidth,
-          h = window.innerHeight; // 현재 브라우저 창의 너비와 높이를 가져옴.
-        camera.aspect = w / h; // 카메리의 aspect ration를 새 창 비율에 맞게 갱신.
-        camera.updateProjectionMatrix(); // 카메라 설정이 바뀌었으니, 내부 행렬 다시 계싼
-        renderer.setSize(w, h); // 렌더러의 캔버스 크기를 새 창 크기에 맞춰 조정.
-      });
-      /*
-            [STEP 6] Perlin noise 값을 ‘자라나는 지형’으로 매핑:
-            로컬 XY 좌표로 샘플 (PlaneGeometry는 XY 평면)
-            높이 = 원본Y + noise * 진폭
-            표면 변형 후 법선 재계산 → 조명 반영
-            */
-      let time = 0;
-      function animate() {
-        controls.update();
-        time += 0.01;
-
-        const scale = 0.05; // 주파수 낮추기
-        const amp = 3.0; // 진폭 낮추기
-        const growth = Math.min(1, time * 0.5);
-
-        for (let i = 0; i < posAttr.count; i++) {
-          const x = base[i * 3 + 0];
-          const z = base[i * 3 + 2];
-
-          const n = fbm2D(x * scale, z * scale, 5, 2.0, 0.5);
-          posAttr.setY(i, n * amp * growth);
-        }
-
-        posAttr.needsUpdate = true;
-        geo.computeVertexNormals();
-        renderer.render(scene, camera);
-        requestAnimationFrame(animate);
-      }
-      animate();
-    </script>
-    <!-- three.js 보일러플레이트 끝 -->
+    <!-- 여기서 .js 로드 -->
+    <script type="module" src="./src/Week3.js"></script>
   </body>
 </html>
