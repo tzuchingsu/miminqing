@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <title>ThermoBug Field – 完整示例</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html,body{margin:0;height:100%;background:#0e1116;font-family:system-ui}
+    #app{position:fixed;inset:0}
+    .hint{
+      position:fixed;left:16px;bottom:16px;color:#c8d1e1;font-size:12px;
+      background:rgba(0,0,0,.45);padding:8px 10px;border-radius:8px;line-height:1.5;user-select:none
+    }
+  </style>
+</head>
+<body>
+<div id="app"></div>
+<div class="hint">
+  拖曳旋轉視角；滾輪縮放。<br/>
+  移動滑鼠 = 熱源；地表與「發光瓢蟲」會對應聚散與變色。<br/>
+  雙擊畫面切換全螢幕。
+</div>
+
+<script type="module">
+/* 使用穩定 CDN */
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+
+/* --------------------------------
+   1) 場景、相機、渲染器
+----------------------------------*/
+const W = innerWidth, H = innerHeight;
+const renderer = new THREE.WebGLRenderer({ antialias:true, powerPreference:'high-performance' });
+renderer.setSize(W,H);
+renderer.setPixelRatio(Math.min(2, devicePixelRatio));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.getElementById('app').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0e1116);
+
+const camera = new THREE.PerspectiveCamera(55, W/H, 0.1, 1000);
+camera.position.set(0, 18, 26);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.target.set(0,0,0);
+
+/* 光線（加亮，避免黑畫面） */
+const hemi = new THREE.HemisphereLight(0x6fb6ff, 0x0a0a0a, 0.6);
+scene.add(hemi);
+const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+dir.position.set(5,10,4);
+scene.add(dir);
+
+/* --------------------------------
+   2) Perlin Noise（生成地形高度）
+----------------------------------*/
+class Perlin {
+  constructor() {
+    this.perm = new Uint8Array(512);
+    const p = new Uint8Array(256);
+    for (let i=0;i<256;i++) p[i]=i;
+    for (let i=255;i>0;i--) { const j=(Math.random()*256)|0; [p[i],p[j]]=[p[j],p[i]]; }
+    for (let i=0;i<512;i++) this.perm[i]=p[i&255];
+  }
+  fade(t){return t*t*t*(t*(t*6-15)+10);}
+  lerp(t,a,b){return a+t*(b-a);}
+  grad(h,x,y,z){const u=h<8?x:y; const v=h<4?y:(h===12||h===14?x:z); return ((h&1)?-u:u)+((h&2)?-v:v);}
+  noise(x,y,z=0){
+    let X=Math.floor(x)&255, Y=Math.floor(y)&255, Z=Math.floor(z)&255;
+    x-=Math.floor(x); y-=Math.floor(y); z-=Math.floor(z);
+    const u=this.fade(x), v=this.fade(y), w=this.fade(z);
+    const A=this.perm[X]+Y,  AA=this.perm[A]+Z,  AB=this.perm[A+1]+Z;
+    const B=this.perm[X+1]+Y, BA=this.perm[B]+Z, BB=this.perm[B+1]+Z;
+    return this.lerp(w,
+      this.lerp(v,
+        this.lerp(u, this.grad(this.perm[AA],x,y,z), this.grad(this.perm[BA],x-1,y,z)),
+        this.lerp(u, this.grad(this.perm[AB],x,y-1,z), this.grad(this.perm[BB],x-1,y-1,z))
+      ),
+      this.lerp(v,
+        this.lerp(u, this.grad(this.perm[AA+1],x,y,z-1), this.grad(this.perm[BA+1],x-1,y,z-1)),
+        this.lerp(u, this.grad(this.perm[AB+1],x,y-1,z-1), this.grad(this.perm[BB+1],x-1,y-1,z-1))
+      )
+    )*0.5+0.5;
+  }
+}
+const perlin = new Perlin();
+
+/* --------------------------------
+   3) 地形（高度 + 熱場顏色/發光）
+----------------------------------*/
+const SIZE = 100;       // 地形邊長
+const RES  = 200;       // 細分
+const NOISE_SCALE = 0.08;
+
+const terrainGeo = new THREE.PlaneGeometry(SIZE, SIZE, RES, RES);
+terrainGeo.rotateX(-Math.PI/2);
+
+// 產生高度
+const pos = terrainGeo.attributes.position;
+for (let i=0;i<pos.count;i++){
+  const x = pos.getX(i), z = pos.getZ(i);
+  const h = (perlin.noise(x*NOISE_SCALE, z*NOISE_SCALE)*6.0) - 2.5;
+  pos.setY(i, h);
+}
+terrainGeo.computeVertexNormals();
+
+const terrainMat = new THREE.ShaderMaterial({
+  uniforms:{
+    uTime:{value:0},
+    uHeatPos:{value:new THREE.Vector3(0,0,0)},    // 滑鼠熱源（世界座標）
+    uHeatRadius:{value:12.0},
+    uHeatStrength:{value:1.5},                    // 提高一點，初始更明顯
+    uBaseTintCold:{value:new THREE.Color(0x112235)},
+    uBaseTintWarm:{value:new THREE.Color(0x2a3445)},
+  },
+  vertexShader:`
+    varying vec3 vPos;
+    varying float vHeight;
+    void main(){
+      vPos = (modelMatrix * vec4(position,1.0)).xyz;
+      vHeight = position.y;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+    }
+  `,
+  fragmentShader:`
+    precision highp float;
+    varying vec3 vPos;
+    varying float vHeight;
+    uniform vec3 uHeatPos;
+    uniform float uHeatRadius;
+    uniform float uHeatStrength;
+    uniform vec3 uBaseTintCold, uBaseTintWarm;
+
+    float smoothPulse(float d, float r){
+      float x = clamp(1.0 - d/r, 0.0, 1.0);
+      return smoothstep(0.0,1.0,x);
+    }
+    vec3 heatRamp(float t){
+      vec3 c1 = vec3(0.10,0.22,0.48);
+      vec3 c2 = vec3(0.12,0.55,0.45);
+      vec3 c3 = vec3(0.95,0.80,0.25);
+      vec3 c4 = vec3(1.00,0.55,0.22);
+      vec3 c5 = vec3(1.00,0.95,0.90);
+      if(t<0.33) return mix(c1,c2, t/0.33);
+      else if(t<0.66) return mix(c2,c3, (t-0.33)/0.33);
+      else return mix(c4,c5, (t-0.66)/0.34);
+    }
+    void main(){
+      float d = distance(vPos.xz, uHeatPos.xz);
+      float heat = smoothPulse(d, uHeatRadius) * uHeatStrength;
+
+      float hN = clamp((vHeight + 2.5)/6.0, 0.0, 1.0);
+      vec3 base = mix(uBaseTintCold, uBaseTintWarm, hN);
+
+      vec3 heatColor = heatRamp(heat);
+      vec3 color = mix(base, heatColor, heat*0.85);
+
+      vec3 emissive = heatColor * pow(heat, 1.5) * 1.2;
+      gl_FragColor = vec4(color + emissive, 1.0);
+    }
+  `,
+});
+const terrain = new THREE.Mesh(terrainGeo, terrainMat);
+scene.add(terrain);
+
+/* 高度取樣（把世界座標映回網格索引） */
+function sampleHeight(x,z){
+  const nx = ((x + SIZE/2) / SIZE) * RES;
+  const nz = ((z + SIZE/2) / SIZE) * RES;
+  const ix = Math.floor(THREE.MathUtils.clamp(nx,0,RES));
+  const iz = Math.floor(THREE.MathUtils.clamp(nz,0,RES));
+  const i = iz*(RES+1)+ix;
+  return terrainGeo.attributes.position.getY(i);
+}
+
+/* --------------------------------
+   4) 發光瓢蟲（Instanced）
+----------------------------------*/
+const BUG_COUNT = 600;
+const bugGeo = new THREE.SphereGeometry(0.12, 16, 12);
+const bugMat = new THREE.ShaderMaterial({
+  uniforms:{
+    uTime:{value:0},
+    uHeatPos:{value:new THREE.Vector3()},
+    uHeatRadius:{value:12.0},
+    uHeatStrength:{value:1.5},
+  },
+  vertexShader:`
+    varying vec3 vWorldPos;
+    void main(){
+      vec4 wp = modelMatrix * vec4(position,1.0);
+      vWorldPos = wp.xyz;
+      gl_Position = projectionMatrix * viewMatrix * wp;
+    }
+  `,
+  fragmentShader:`
+    precision highp float;
+    varying vec3 vWorldPos;
+    uniform vec3 uHeatPos;
+    uniform float uHeatRadius;
+    uniform float uHeatStrength;
+
+    float smoothPulse(float d, float r){
+      float x = clamp(1.0 - d/r, 0.0, 1.0);
+      return smoothstep(0.0,1.0,x);
+    }
+    vec3 heatRamp(float t){
+      vec3 c1=vec3(0.05,0.20,0.60);
+      vec3 c2=vec3(0.20,0.85,0.70);
+      vec3 c3=vec3(1.00,0.80,0.25);
+      vec3 c4=vec3(1.00,0.45,0.20);
+      if(t<0.33) return mix(c1,c2,t/0.33);
+      else if(t<0.66) return mix(c2,c3,(t-0.33)/0.33);
+      else return mix(c3,c4,(t-0.66)/0.34);
+    }
+    void main(){
+      float d = distance(vWorldPos.xz, uHeatPos.xz);
+      float heat = smoothPulse(d, uHeatRadius) * uHeatStrength;
+
+      vec3 shell = vec3(0.25,0.05,0.06);     // 深紅殼
+      vec3 glow  = heatRamp(heat);
+      float breath = 0.4 + 0.6*pow(heat,1.2);
+
+      vec3 color = mix(shell, glow, 0.35 + 0.65*heat);
+      vec3 emiss = glow * breath * 1.4;
+
+      gl_FragColor = vec4(color + emiss, 1.0);
+    }
+  `,
+  transparent:false
+});
+const bugs = new THREE.InstancedMesh(bugGeo, bugMat, BUG_COUNT);
+scene.add(bugs);
+
+/* 初始化個體位置 + 速度 */
+const dummy = new THREE.Object3D();
+const bugVel = new Array(BUG_COUNT).fill(0).map(()=>new THREE.Vector3());
+const rnd = (a,b)=>a+Math.random()*(b-a);
+
+for(let i=0;i<BUG_COUNT;i++){
+  dummy.position.set(rnd(-SIZE*0.45,SIZE*0.45), 0, rnd(-SIZE*0.45,SIZE*0.45));
+  dummy.position.y = sampleHeight(dummy.position.x, dummy.position.z) + 0.25;
+  dummy.rotation.y = Math.random()*Math.PI*2;
+  dummy.updateMatrix();
+  bugs.setMatrixAt(i, dummy.matrix);
+  bugVel[i].set(rnd(-0.2,0.2),0,rnd(-0.2,0.2));
+}
+
+/* --------------------------------
+   5) 滑鼠 → 熱源位置（世界座標）
+----------------------------------*/
+const mouseN = new THREE.Vector2(0,0);
+const raycaster = new THREE.Raycaster();
+const planeY0 = new THREE.Plane(new THREE.Vector3(0,1,0), 0);
+const heatPos = new THREE.Vector3(0,0,0);
+
+renderer.domElement.addEventListener('pointermove', (e)=>{
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouseN.x = ((e.clientX - rect.left)/rect.width)*2 - 1;
+  mouseN.y = -(((e.clientY - rect.top)/rect.height)*2 - 1);
+  raycaster.setFromCamera(mouseN, camera);
+  const pt = new THREE.Vector3();
+  raycaster.ray.intersectPlane(planeY0, pt);
+  heatPos.set(pt.x, 0, pt.z);
+});
+
+/* --------------------------------
+   6) 更新（熱導向 + 簡化分離）
+----------------------------------*/
+const clock = new THREE.Clock();
+
+function updateBugs(dt){
+  const SEEK = 0.08;     // 朝適溫帶吸引
+  const AVOID = 0.12;    // 過熱/過冷排斥
+  const SEP_RADIUS = 0.6;
+  const SEP_FORCE  = 0.08;
+  const SPEED = 1.2;
+
+  for(let i=0;i<BUG_COUNT;i++){
+    // 讀位置
+    bugs.getMatrixAt(i, dummy.matrix);
+    dummy.position.setFromMatrixPosition(dummy.matrix);
+
+    // 熱導向：形成「適溫環帶」聚集
+    const toHeat = new THREE.Vector3().subVectors(heatPos, dummy.position);
+    const dist = Math.max(0.001, toHeat.length());
+    toHeat.normalize();
+    const idealR = 8.0;  // 適溫半徑
+
+    let thermal = new THREE.Vector3();
+    if (dist > idealR*1.05){
+      thermal.copy(toHeat).multiplyScalar(SEEK);
+    } else if (dist < idealR*0.85){
+      thermal.copy(toHeat).multiplyScalar(-AVOID);
+    } else {
+      const tangent = new THREE.Vector3(-toHeat.z, 0, toHeat.x);
+      thermal.copy(tangent).multiplyScalar(0.06); // 在環帶上游走
+    }
+
+    // 簡化分離：隨機抽樣鄰居避免重疊
+    let sep = new THREE.Vector3();
+    for (let k=0;k<4;k++){
+      const j = (Math.random()*BUG_COUNT)|0;
+      if (j===i) continue;
+      bugs.getMatrixAt(j, dummy.matrix);
+      const pj = new THREE.Vector3().setFromMatrixPosition(dummy.matrix);
+      const d = pj.distanceTo(dummy.position);
+      if (d<SEP_RADIUS && d>0.0001){
+        const away = new THREE.Vector3().subVectors(dummy.position, pj).multiplyScalar(1.0/(d*d));
+        sep.add(away);
+      }
+    }
+    sep.multiplyScalar(SEP_FORCE);
+
+    // 合力 → 速度
+    bugVel[i].add(thermal).add(sep);
+    if (bugVel[i].length()>SPEED) bugVel[i].setLength(SPEED);
+    bugVel[i].multiplyScalar(0.985); // 阻尼
+
+    // 更新位置（貼地）
+    dummy.position.addScaledVector(bugVel[i], dt);
+    dummy.position.y = sampleHeight(dummy.position.x, dummy.position.z) + 0.25;
+
+    // 面向移動方向
+    if (bugVel[i].lengthSq()>1e-4){
+      dummy.rotation.y = Math.atan2(bugVel[i].x, bugVel[i].z);
+    }
+    dummy.updateMatrix();
+    bugs.setMatrixAt(i, dummy.matrix);
+  }
+  bugs.instanceMatrix.needsUpdate = true;
+}
+
+function render(){
+  const t = clock.getElapsedTime();
+  const dt = clock.getDelta();
+
+  controls.update();
+
+  terrainMat.uniforms.uTime.value = t;
+  terrainMat.uniforms.uHeatPos.value.copy(heatPos);
+
+  bugMat.uniforms.uTime.value = t;
+  bugMat.uniforms.uHeatPos.value.copy(heatPos);
+
+  updateBugs(Math.min(dt, 0.033)); // 限制步長避免跳動
+  renderer.render(scene, camera);
+}
+renderer.setAnimationLoop(render);
+
+/* 互動：雙擊全螢幕、視窗調整 */
+document.addEventListener('dblclick', ()=>{
+  if (!document.fullscreenElement) renderer.domElement.requestFullscreen();
+  else document.exitFullscreen();
+});
+addEventListener('resize', ()=>{
+  const w=innerWidth, h=innerHeight;
+  renderer.setSize(w,h);
+  camera.aspect=w/h; camera.updateProjectionMatrix();
+});
+</script>
+</body>
+</html>

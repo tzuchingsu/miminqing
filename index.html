@@ -3,27 +3,26 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Canyon: Terrace fBm + OpenSimplex, Flat River (Light Fog)</title>
+    <title>GenerativeCreature — Terrain (Perlin Displacement)</title>
     <style>
       html, body { height: 100%; margin: 0; }
       body { overflow: hidden; background: #ffffff; }
       canvas { display: block; }
     </style>
 
-    <!-- 正確的 importmap：three / addons / OrbitControls / lil-gui -->
+    <!-- importmap: three / addons / OrbitControls -->
     <script type="importmap">
     {
       "imports": {
         "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
         "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
-        "three/examples/jsm/controls/OrbitControls": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js",
-        "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19.2/dist/lil-gui.esm.min.js"
+        "three/examples/jsm/controls/OrbitControls": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js"
       }
     }
     </script>
   </head>
   <body>
-    <!-- 你的主程式 -->
-    <script type="module" src="./src/Week6.js"></script>
+    <!-- app starts here -->
+    <script type="module" src="./src/main.js"></script>
   </body>
 </html>
