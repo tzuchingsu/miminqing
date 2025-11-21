@@ -3,26 +3,47 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>GenerativeCreature — Terrain (Perlin Displacement)</title>
+    <title>GenerativeCreature — Glowing Stochastic Trees</title>
     <style>
       html, body { height: 100%; margin: 0; }
-      body { overflow: hidden; background: #ffffff; }
+      body { overflow: hidden; background: #0f0f12; }
       canvas { display: block; }
+      .hint {
+        position: fixed; left: 10px; bottom: 10px; color: #ddd;
+        font: 12px/1.4 ui-monospace, Menlo, Monaco, Consolas, "Courier New", monospace;
+        background: rgba(0,0,0,.35); padding: 8px 10px; border-radius: 8px;
+        pointer-events: none;
+      }
+      .panel {
+        position: fixed; right: 12px; bottom: 12px; display: flex; gap: 8px;
+        background: rgba(0,0,0,.40); padding: 8px 10px; border-radius: 10px;
+        font-family: ui-monospace, Menlo, Monaco, Consolas, "Courier New", monospace;
+      }
+      .panel button {
+        font-size: 12px; padding: 6px 10px; border-radius: 8px; border: 1px solid #555;
+        background: #1b1b22; color: #eee; cursor: pointer;
+      }
+      .panel button:hover { background: #252530; }
     </style>
 
-    <!-- importmap: three / addons / OrbitControls -->
     <script type="importmap">
     {
       "imports": {
         "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
-        "three/examples/jsm/controls/OrbitControls": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js"
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
       }
     }
     </script>
   </head>
   <body>
-    <!-- app starts here -->
+    <div class="hint">
+      Space 生長/暫停 · [ / ] 世代 -/+ · J/K 角度 -/+ · N/M 衰減 +/- · D 日/夜 · +/= 也能加<br/>
+      ✅ G：切換無限成長（自動 + 世代 & 定期長新樹） · 葉片在夜晚會發光
+    </div>
+    <div class="panel">
+      <button id="btn-grow">▶ 無限成長 (G)</button>
+      <button id="btn-stop">■ 停止</button>
+    </div>
     <script type="module" src="./src/main.js"></script>
   </body>
 </html>
