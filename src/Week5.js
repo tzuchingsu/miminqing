@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import GUI from "lil-gui";
+import { GUI } from "https://cdn.jsdelivr.net/npm/lil-gui@0.19/+esm";
 
 // HUD
 const hud = document.getElementById("hud");
