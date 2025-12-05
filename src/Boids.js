@@ -9,7 +9,7 @@ export const RD_TEXTURE_PATHS = [
   "./assets/textures/RD1.png",  // patternId 1
   "./assets/textures/RD2.png",  // patternId 2
   "./assets/textures/RD3.png",  // patternId 3
-  "./assets/textures/RD5.png",  // patternId 4
+  "./assets/textures/RD4.png",  // patternId 4
 ];
 
 const rdLoader = new THREE.TextureLoader();
@@ -68,6 +68,27 @@ const PARAM = {
   MAX_HOVER: 1.0,
 };
 
+// ───────────────────────────────
+// Slime Mold Sensing / Trail
+// ───────────────────────────────
+const BOUND_RADIUS = 100;
+
+const SENSOR_DISTANCE = 12;
+const SENSOR_ANGLE = Math.PI / 4;
+
+const TRAIL_GRID_SIZE = 128;
+const TRAIL_CELL_SIZE = (BOUND_RADIUS * 2) / TRAIL_GRID_SIZE;
+
+const TRAIL_DEPOSIT_AMOUNT = 3.0;
+const TRAIL_DECAY_RATE = 0.96;
+const W_TRAIL_FOLLOW = 1.5;
+
+let trailGrid = new Float32Array(TRAIL_GRID_SIZE * TRAIL_GRID_SIZE);
+
+let trailTexture = null;
+let trailTextureData = null;
+let trailMesh = null;
+
 /* ========================
  * 內部狀態
  * ======================== */
@@ -84,6 +105,67 @@ const Field = {
   eps: 1e-3,
   emitters: [],
 };
+
+/* ========================
+ * 營養源場 (Nutrient field)
+ * ======================== */
+
+// 內部營養源儲存陣列
+const nutrientPoints = [];
+
+// 近距離作用範圍
+const NUTRIENT_INNER_R = 1.0;
+const NUTRIENT_OUTER_R = 6.0;
+
+export function setNutrientPoints(points) {
+  nutrientPoints.length = 0;
+  for (const p of points) {
+    if (!p) continue;
+    if (p.isVector3) {
+      nutrientPoints.push(p.clone());
+    } else {
+      nutrientPoints.push(
+        new THREE.Vector3(p.x, p.y ?? 0, p.z)
+      );
+    }
+  }
+}
+
+export function addNutrientPoint(x, y, z) {
+  nutrientPoints.push(new THREE.Vector3(x, y, z));
+}
+
+function getNutrientForce(pos) {
+  const dir = new THREE.Vector3(0, 0, 0);
+  if (!nutrientPoints.length) return dir;
+
+  for (const n of nutrientPoints) {
+    const dx = n.x - pos.x;
+    const dz = n.z - pos.z;
+    const d2 = dx * dx + dz * dz;
+
+    const rOut2 = NUTRIENT_OUTER_R * NUTRIENT_OUTER_R;
+    if (d2 <= 1e-6 || d2 > rOut2) continue;
+
+    const d = Math.sqrt(d2);
+    const w = THREE.MathUtils.smoothstep(
+      d,
+      NUTRIENT_OUTER_R,
+      NUTRIENT_INNER_R
+    );
+    if (w <= 0) continue;
+
+    dir.x += (dx / d) * w;
+    dir.z += (dz / d) * w;
+  }
+
+  if (dir.lengthSq() < 1e-6) {
+    dir.set(0, 0, 0);
+    return dir;
+  }
+  dir.normalize();
+  return dir;
+}
 
 // 點擊後「驚嚇」窗口
 const Panic = { activeUntil: 0, radiusMul: 1.15 };
@@ -115,7 +197,6 @@ function yawTowards(currYaw, vx, vz, dt) {
 
 /* HSV → THREE.Color */
 function hsvToRgb(hDeg, s, v) {
-  // h: 0~360
   const h = ((hDeg % 360) + 360) % 360 / 60;
   const i = Math.floor(h);
   const f = h - i;
@@ -236,6 +317,57 @@ function makeHeatVisual() {
   return group;
 }
 
+// ───────────────────────────────
+// Sensing force 함수
+// ───────────────────────────────
+const _yAxis = new THREE.Vector3(0, 1, 0);
+const _tmpDir = new THREE.Vector3();
+const _tmpLeftDir = new THREE.Vector3();
+const _tmpRightDir = new THREE.Vector3();
+
+const TRAIL_MAX_POINTS = 220;
+
+function applyTrailSensingForce(agentIndex, accOut) {
+  const pos = boidPositions[agentIndex];
+  const vel = boidVelocities[agentIndex];
+
+  if (vel.lengthSq() < 1e-6) return;
+
+  _tmpDir.copy(vel).normalize();
+
+  _tmpLeftDir.copy(_tmpDir).applyAxisAngle(_yAxis, +SENSOR_ANGLE);
+  _tmpRightDir.copy(_tmpDir).applyAxisAngle(_yAxis, -SENSOR_ANGLE);
+
+  const fx = pos.x + _tmpDir.x * SENSOR_DISTANCE;
+  const fz = pos.z + _tmpDir.z * SENSOR_DISTANCE;
+
+  const lx = pos.x + _tmpLeftDir.x * SENSOR_DISTANCE;
+  const lz = pos.z + _tmpLeftDir.z * SENSOR_DISTANCE;
+
+  const rx = pos.x + _tmpRightDir.x * SENSOR_DISTANCE;
+  const rz = pos.z + _tmpRightDir.z * SENSOR_DISTANCE;
+
+  const valF = sampleTrail(fx, fz);
+  const valL = sampleTrail(lx, lz);
+  const valR = sampleTrail(rx, rz);
+
+  let bestDir = _tmpDir;
+  let bestVal = valF;
+
+  if (valL > bestVal) {
+    bestVal = valL;
+    bestDir = _tmpLeftDir;
+  }
+  if (valR > bestVal) {
+    bestVal = valR;
+    bestDir = _tmpRightDir;
+  }
+
+  if (bestVal <= 0.001) return;
+
+  accOut.addScaledVector(bestDir, W_TRAIL_FOLLOW * bestVal);
+}
+
 /* ========================
  * 발광 제어 (per object uGlow)
  * ======================== */
@@ -287,13 +419,6 @@ totalEmissiveRadiance += heatColor * (1.10 * uGlow);
  * GA: Genome → Boid 적용
  * ======================== */
 
-/**
- * Genome → Boid 매핑
- * - hue/value → 몸 색
- * - patternId → RD 텍스처
- * - bodyScale → 전체 스케일
- * - baseSpeed / showOff → 움직임에 영향 (per agent param)
- */
 export function applyGenomeToBoid(index, genome) {
   const a = agents[index];
   if (!a) return;
@@ -312,7 +437,7 @@ export function applyGenomeToBoid(index, genome) {
     });
   });
 
-  // 2) 색상 (HSV → RGB, 채도는 showOff 기반)
+  // 2) 색상（身體）
   const hue = genome.hue ?? 220;
   const value = genome.value ?? 0.8;
   const showOff = genome.showOff ?? 0.5;
@@ -327,20 +452,36 @@ export function applyGenomeToBoid(index, genome) {
     });
   });
 
+  // 2.5) 線條顏色：根據 body 顏色調亮，保持同一色系
+  if (!a.trailColor) {
+    a.trailColor = new THREE.Color(1.0, 0.7, 0.2);
+  }
+
+  const hsl = { h: 0, s: 0, l: 0 };
+  col.getHSL(hsl);
+
+  // 線條比身體稍微更飽和、亮一點，讓路徑更顯眼
+  const lineS = THREE.MathUtils.clamp(hsl.s + 0.2, 0.0, 1.0);
+  const lineL = THREE.MathUtils.clamp(0.55 + 0.25 * (showOff ?? 0.5), 0.0, 1.0);
+
+  const lineColor = new THREE.Color().setHSL(hsl.h, lineS, lineL);
+  a.trailColor.copy(lineColor);
+
+  if (a.trailLine && a.trailLine.material) {
+    a.trailLine.material.color.copy(lineColor);
+    a.trailLine.material.needsUpdate = true;
+  }
+
   // 3) 스케일
   const scale = genome.bodyScale ?? 1.0;
   a.baseScale = scale;
-  a.obj.scale.setScalar(scale);
+  // 實際縮放在 update 內再乘上 lifeScale / trailScale
 
-  // 4) 움직임 파라미터 (per agent)
+  // 4) 움직임 파라미터
   a.speedFactor = genome.baseSpeed ?? 1.0;
   a.showOff = showOff;
 }
 
-/**
- * 새 세대 population 전체를 보이드에 적용
- * - indices 인자가 있으면 해당 슬롯만 적용
- */
 export function applyPopulationGenomes(population, indices = null) {
   if (!population || !population.length) return;
 
@@ -357,6 +498,61 @@ export function applyPopulationGenomes(population, indices = null) {
 }
 
 /* ========================
+ * Trail grid 헬퍼
+ * ======================== */
+function worldToTrailIndex(x, z) {
+  const u = (x + BOUND_RADIUS) / (BOUND_RADIUS * 2);
+  const v = (z + BOUND_RADIUS) / (BOUND_RADIUS * 2);
+
+  const ix = Math.floor(
+    THREE.MathUtils.clamp(u, 0, 0.999) * TRAIL_GRID_SIZE
+  );
+  const iz = Math.floor(
+    THREE.MathUtils.clamp(v, 0, 0.999) * TRAIL_GRID_SIZE
+  );
+
+  return ix + iz * TRAIL_GRID_SIZE;
+}
+
+function sampleTrail(x, z) {
+  const idx = worldToTrailIndex(x, z);
+  return trailGrid[idx];
+}
+
+function getTrailStrengthAt(pos) {
+  const value = sampleTrail(pos.x, pos.z);
+  const MAX_VIS_VALUE = 1.5;
+  let t = value / MAX_VIS_VALUE;
+  if (t > 1) t = 1;
+  if (t < 0) t = 0;
+  return t;
+}
+
+function decayTrail() {
+  for (let i = 0; i < trailGrid.length; i++) {
+    trailGrid[i] *= TRAIL_DECAY_RATE;
+  }
+}
+
+function updateTrailTexture() {
+  if (!trailTexture || !trailTextureData) return;
+
+  const MAX_VIS_VALUE = 1.5;
+  for (let i = 0; i < trailGrid.length; i++) {
+    let t = trailGrid[i] / MAX_VIS_VALUE;
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    trailTextureData[i] = Math.floor(t * 255);
+  }
+  trailTexture.needsUpdate = true;
+}
+
+function depositTrail(x, z, amount = TRAIL_DEPOSIT_AMOUNT) {
+  const idx = worldToTrailIndex(x, z);
+  trailGrid[idx] += amount;
+}
+
+/* ========================
  * 初始化
  * ======================== */
 
@@ -367,7 +563,7 @@ export function initBoids({
   terrainRoot: _terrainRoot,
   prototypeNode,
   count = 20,
-  initialGenomes = null, // GA에서 넘겨주는 초기 population
+  initialGenomes = null,
 }) {
   scene = _scene;
   camera = _camera;
@@ -385,6 +581,38 @@ export function initBoids({
   heatGroup = makeHeatVisual();
   scene.add(heatGroup);
 
+  {
+    // DataTexture 用的 Uint8 灰階資料
+    trailTextureData = new Uint8Array(TRAIL_GRID_SIZE * TRAIL_GRID_SIZE);
+
+    trailTexture = new THREE.DataTexture(
+      trailTextureData,
+      TRAIL_GRID_SIZE,
+      TRAIL_GRID_SIZE,
+      THREE.LuminanceFormat
+    );
+    trailTexture.minFilter = THREE.LinearFilter;
+    trailTexture.magFilter = THREE.LinearFilter;
+    trailTexture.wrapS = THREE.ClampToEdgeWrapping;
+    trailTexture.wrapT = THREE.ClampToEdgeWrapping;
+    trailTexture.needsUpdate = true;
+
+    const trailMat = new THREE.MeshBasicMaterial({
+      map: trailTexture,
+      transparent: true,
+      opacity: 0.9,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      depthTest: true,
+    });
+
+    const planeGeo = new THREE.PlaneGeometry(BOUND_RADIUS * 2, BOUND_RADIUS * 2);
+    trailMesh = new THREE.Mesh(planeGeo, trailMat);
+    trailMesh.rotation.x = -Math.PI * 0.5;
+    trailMesh.position.set(0, 0.05, 0);
+    scene.add(trailMesh);
+  }
+
   // 生成 (Poisson-like)
   const size = terrainRoot?.userData?.size ?? 200;
   const spawnR = Math.min(16, size * 0.25);
@@ -392,9 +620,7 @@ export function initBoids({
   agents = [];
 
   for (let i = 0; i < PARAM.COUNT; i++) {
-    let p,
-      ok = false,
-      tries = 0;
+    let p, ok = false, tries = 0;
     while (!ok && tries < 240) {
       const ang = Math.random() * Math.PI * 2;
       const r = Math.sqrt(Math.random()) * spawnR;
@@ -413,7 +639,7 @@ export function initBoids({
 
     const inst = protoNode.clone(true);
 
-    // 初始化時調整大小（你之前設 7.0，我幫你保留）
+    // 初始大小（之後會再被 baseScale/state 調整）
     inst.scale.setScalar(7.0);
 
     inst.name = `ThermoBug_${i}`;
@@ -427,6 +653,24 @@ export function initBoids({
     const yaw = Math.random() * Math.PI * 2;
     const hopPhase = Math.random() * Math.PI * 2;
 
+    // trail Line
+    const trailGeo = new THREE.BufferGeometry().setFromPoints([
+      p.clone(), p.clone()
+    ]);
+
+    const trailLineMat = new THREE.LineBasicMaterial({
+      color: new THREE.Color(1.0, 0.7, 0.2), // 先隨便給，之後 applyGenomeToBoid 會根據顏色改掉
+      transparent: true,
+      opacity: 0.7,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      depthTest: true,
+    });
+
+    const trailLine = new THREE.Line(trailGeo, trailLineMat);
+    trailLine.position.set(0, 0.02, 0);
+    scene.add(trailLine);
+
     const agent = {
       obj: inst,
       pos: p.clone(),
@@ -435,21 +679,26 @@ export function initBoids({
       hopPhase,
       setGlow,
       _noise: Math.random() * 1000,
-      // GA 관련
       genome: null,
       speedFactor: 1.0,
       showOff: 0.5,
       baseScale: 1.0,
-      // Life state
+      // life state
       state: LIFE.ALIVE,
       deathT: 0,
       newbornT: 0,
+      lifeScale: 1.0,
+      lifeVisibility: 1.0,
+      // trail 可視化
+      trailPoints: [p.clone()],
+      trailLine,
+      trailColor: new THREE.Color(1.0, 0.7, 0.2),
     };
 
     agents.push(agent);
   }
 
-  // 初始 Genome → 套用到 Boids
+  // 初始 Genome
   if (initialGenomes && initialGenomes.length) {
     applyPopulationGenomes(initialGenomes);
   }
@@ -492,22 +741,36 @@ export function initBoids({
  * ======================== */
 
 export function markSelection(survivorIndices, doomedIndices, deathDuration = DEATH_ANIM_DURATION) {
+  // 生還者：如果原本 DEAD，就讓他重新活過來（含 trail）
   for (const idx of survivorIndices) {
     const a = agents[idx];
     if (!a) continue;
     if (a.state === LIFE.DEAD) {
       a.state = LIFE.ALIVE;
-      a.obj.visible = true;
       a.deathT = 0;
+      a.newbornT = 0;
+      a.lifeScale = 1.0;
+      a.lifeVisibility = 1.0;
+      a.obj.visible = true;
+      if (a.trailLine) {
+        a.trailLine.visible = true;
+        if (a.trailPoints && a.trailPoints.length === 0) {
+          a.trailPoints.push(a.pos.clone());
+        }
+      }
     }
   }
 
+  // 淘汰者：進入 DYING 狀態，開始慢慢縮小＋淡出
   for (const idx of doomedIndices) {
     const a = agents[idx];
     if (!a) continue;
     a.state = LIFE.DYING;
     a.deathT = 0;
+    a.lifeScale = 1.0;
+    a.lifeVisibility = 1.0;
     a.obj.visible = true;
+    if (a.trailLine) a.trailLine.visible = true;
   }
 }
 
@@ -517,7 +780,25 @@ export function markNewborn(indices, duration = NEWBORN_ANIM_DURATION) {
     if (!a) continue;
     a.state = LIFE.NEWBORN;
     a.newbornT = 0;
+    a.deathT = 0;
+    a.lifeScale = 0.0;
+    a.lifeVisibility = 0.0;
+
+    // 一開始幾乎看不到，慢慢長大
     a.obj.visible = true;
+    a.obj.scale.setScalar(0.001);
+
+    // Trail 重新開始：先清掉舊的點，從目前位置慢慢畫
+    if (a.trailPoints) {
+      a.trailPoints.length = 0;
+      a.trailPoints.push(a.pos.clone());
+    }
+    if (a.trailLine) {
+      a.trailLine.visible = true;
+      const m = a.trailLine.material;
+      m.opacity = 0.0;
+      m.needsUpdate = true;
+    }
   }
 }
 
@@ -528,6 +809,9 @@ export function markNewborn(indices, duration = NEWBORN_ANIM_DURATION) {
 const _tmp = new THREE.Vector3();
 
 export function updateBoids(dt, tSec) {
+  // 0) trail 整體衰減
+  decayTrail();
+
   if (!agents.length) return;
 
   // 熱圈位置 / 半徑
@@ -539,37 +823,54 @@ export function updateBoids(dt, tSec) {
   for (let i = 0; i < agents.length; i++) {
     const a = agents[i];
 
+    // DEAD：完全看不到本體與線
     if (a.state === LIFE.DEAD) {
       a.obj.visible = false;
+      if (a.trailLine) a.trailLine.visible = false;
       continue;
     }
+
     a.obj.visible = true;
+    if (a.trailLine) a.trailLine.visible = true;
+
+    // lifeScale / lifeVisibility: 0~1 決定「有多活著」
+    let lifeScale = 1.0;
+    let lifeVisibility = 1.0;
 
     // 1) Life state 애니메이션
     if (a.state === LIFE.DYING) {
       a.deathT += dt;
       const t = clamp(a.deathT / DEATH_ANIM_DURATION, 0, 1);
-      const s = THREE.MathUtils.lerp(1.0, 0.2, t);
-      a.obj.scale.setScalar(a.baseScale * s);
-      a.pos.y -= dt * 0.15;
+      const fade = 1.0 - t;           // 1 → 0
+      lifeScale = fade;
+      lifeVisibility = fade;
+
+      // 慢慢往下沉
+      a.pos.y -= dt * 0.15 * fade;
+
       if (t >= 1.0) {
         a.state = LIFE.DEAD;
         a.obj.visible = false;
+        if (a.trailLine) a.trailLine.visible = false;
         continue;
       }
     } else if (a.state === LIFE.NEWBORN) {
       a.newbornT += dt;
       const t = clamp(a.newbornT / NEWBORN_ANIM_DURATION, 0, 1);
-      const pulse = 1.0 + 0.15 * Math.sin(t * Math.PI * 2.0);
-      const s = (0.2 + 0.8 * t) * pulse;
-      a.obj.scale.setScalar(a.baseScale * s);
+      const eased = t * t * (3 - 2 * t); // smoothstep
+      lifeScale = eased;
+      lifeVisibility = eased;
+
       if (t >= 1.0) {
         a.state = LIFE.ALIVE;
-        a.obj.scale.setScalar(a.baseScale);
+        a.deathT = 0;
+        lifeScale = 1.0;
+        lifeVisibility = 1.0;
       }
-    } else if (a.state === LIFE.ALIVE) {
-      a.obj.scale.setScalar(a.baseScale);
     }
+
+    a.lifeScale = lifeScale;
+    a.lifeVisibility = lifeVisibility;
 
     // 2) Boids 세력
     let nCnt = 0;
@@ -630,7 +931,8 @@ export function updateBoids(dt, tSec) {
       steerZ += (dzs / d) * PARAM.SEEK_GAIN;
     }
 
-    const isOverheated = Field.sun.heatPulse > PARAM.OVERHEAT_PULSE && rhoSun > PARAM.OVERHEAT_TEMP;
+    const isOverheated =
+      Field.sun.heatPulse > PARAM.OVERHEAT_PULSE && rhoSun > PARAM.OVERHEAT_TEMP;
     if (isOverheated) {
       steerX -= gradSunX * PARAM.REPEL_GAIN;
       steerZ -= gradSunZ * PARAM.REPEL_GAIN;
@@ -656,6 +958,11 @@ export function updateBoids(dt, tSec) {
 
     ax += steerX;
     az += steerZ;
+
+    // nutrientForce
+    const nutrientForce = getNutrientForce(a.pos);
+    ax += nutrientForce.x * 0.7;
+    az += nutrientForce.z * 0.7;
 
     a._noise += dt * 0.8;
     const J = 0.3;
@@ -690,8 +997,16 @@ export function updateBoids(dt, tSec) {
       a.vel.z *= s;
     }
 
+    // 位置更新
     a.pos.x += a.vel.x * dt;
     a.pos.z += a.vel.z * dt;
+
+    // 지나간 자리에 trail 남기기 (Deposit)
+    depositTrail(
+      a.pos.x,
+      a.pos.z,
+      TRAIL_DEPOSIT_AMOUNT * lifeVisibility
+    );
 
     // 5) 地形 貼地 + 坡度對齊
     let groundP, groundN;
@@ -719,7 +1034,7 @@ export function updateBoids(dt, tSec) {
     _tmp.set(Math.sin(a.yaw), 0, Math.cos(a.yaw));
     look.lookAt(a.pos.x + _tmp.x, baseY + _tmp.y, a.pos.z + _tmp.z);
 
-    // 6) 跳動 (showOff 越大 → HOP_AMP 稍微增強)
+    // 6) 跳動
     const hopBoost = 1.0 + 0.4 * clamp(a.showOff ?? 0.5, 0, 1);
     a.hopPhase +=
       (PARAM.HOP_FREQ_BASE + PARAM.HOP_FREQ_FARBOOST * clamp(farBoost, 0, 1)) *
@@ -727,19 +1042,56 @@ export function updateBoids(dt, tSec) {
       Math.PI *
       2;
     const sHop = 0.5 + 0.5 * Math.sin(a.hopPhase);
-    const yHop =
-      4.0 * sHop * (1.0 - sHop) * PARAM.HOP_AMP * hopBoost;
+    const yHop = 4.0 * sHop * (1.0 - sHop) * PARAM.HOP_AMP * hopBoost;
 
     a.obj.position.set(a.pos.x, baseY + yHop, a.pos.z);
     a.obj.quaternion.copy(look.quaternion);
 
-    // 7) 熱暈 (紅色發光)
+    // 6.5) trail 강도 → 크기 / 밝기 반영
+    const trailStrength = getTrailStrengthAt(a.pos); // 0~1
+
+    // 몸 크기: trail + lifeScale
+    const sizeMulTrail = 0.8 + 0.5 * trailStrength;
+    const finalScale = a.baseScale * sizeMulTrail * lifeScale;
+    a.obj.scale.setScalar(finalScale);
+
+    // 7) 熱暈 (紅色發光) + lifeVisibility + trailGlow
     let g = (rhoSun - PARAM.GLOW_INNER) / (PARAM.GLOW_OUTER - PARAM.GLOW_INNER);
     g = clamp(g, 0, 1);
     g = g * g * g;
+
+    const trailGlowBoost = 0.7 * trailStrength;
+    g = clamp(g + trailGlowBoost, 0, 1);
+
+    // 死亡/誕生過程中，同步淡入淡出
+    g *= lifeVisibility;
+
     a.setGlow(g);
+
+    // 8) emission line (Trail Line) 更新
+    if (a.trailLine && a.trailPoints) {
+      const trailY = baseY + 0.1;
+      a.trailPoints.push(new THREE.Vector3(a.pos.x, trailY, a.pos.z));
+
+      if (a.trailPoints.length > TRAIL_MAX_POINTS) {
+        a.trailPoints.shift();
+      }
+
+      a.trailLine.geometry.setFromPoints(a.trailPoints);
+
+      const mat = a.trailLine.material;
+      const tTrail = trailStrength; // 0~1
+      let alpha = 0.2 + 0.8 * tTrail;
+      alpha *= lifeVisibility;      // 死亡時一起變淡，新生時慢慢變亮
+      mat.opacity = alpha;
+      mat.needsUpdate = true;
+
+      // 顏色已在 applyGenomeToBoid 依照身體顏色設定過，
+      // 這裡就讓亮暗由 trail 強度 / lifeVisibility 決定即可。
+    }
   }
 
+  updateTrailTexture();
   Field.sun.heatPulse *= 0.98;
 }
 
@@ -765,7 +1117,8 @@ export function killNearest(x, z) {
     }
   }
   if (k >= 0) {
-    scene.remove(agents[k].obj);
+    if (agents[k].obj) scene.remove(agents[k].obj);
+    if (agents[k].trailLine) scene.remove(agents[k].trailLine);
     agents.splice(k, 1);
   }
 }
