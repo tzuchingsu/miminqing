@@ -1122,3 +1122,42 @@ export function killNearest(x, z) {
     agents.splice(k, 1);
   }
 }
+// ─────────────────────────────────────────────
+// Runtime average speed (0~5) for environment sound
+// - Slow / idle => near 0
+// - Following mouse / active => closer to 5
+// ─────────────────────────────────────────────
+export function getRuntimeAvgSpeed01to05() {
+  // ✅ 把這裡的 boids 變數名換成你 Boids.js 裡真正的陣列
+  const list =
+    (typeof boids !== "undefined" ? boids : null) ||
+    (typeof agents !== "undefined" ? agents : null) ||
+    (typeof flock !== "undefined" ? flock : null);
+
+  if (!list || !list.length) return 0;
+
+  // ✅ 速度向量欄位：依你實際結構改（velI / vel / velocity）
+  const VEL_FIELD = "velI";
+
+  let sum = 0;
+  let n = 0;
+
+  for (const b of list) {
+    const v = b?.[VEL_FIELD] || b?.velocity || b?.vel;
+    if (!v) continue;
+
+    const sp = Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    sum += sp;
+    n++;
+  }
+
+  if (!n) return 0;
+
+  // ✅ 把「實際速度」映射到 0~5
+  // 如果你跟隨滑鼠時速度大概落在 0~(某個數)，調整 SPEED_MAX 即可
+  const avg = sum / n;
+  const SPEED_MAX = 2.2; // 👈 重要：跟隨滑鼠時若覺得風不夠大，調小；太大就調大
+  const t = Math.max(0, Math.min(1, avg / SPEED_MAX));
+
+  return t * 5;
+}

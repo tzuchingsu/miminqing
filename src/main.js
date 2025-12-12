@@ -18,6 +18,8 @@ import {
   DEATH_ANIM_DURATION,
   SURVIVORS_WINDOW,
   NEWBORN_ANIM_DURATION,
+  // ✅ NEW: runtime average speed (0~5) from Boids.js
+  getRuntimeAvgSpeed01to05,
 } from "./Boids.js";
 import { LSystemPlant } from "./lsystem.js";
 import { GeneticAlgorithm } from "./ga.js";
@@ -49,12 +51,7 @@ const pmrem = new THREE.PMREMGenerator(renderer);
 scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
 scene.background = new THREE.Color(0x0f0f12);
 
-const camera = new THREE.PerspectiveCamera(
-  60,
-  window.innerWidth / window.innerHeight,
-  0.1,
-  1000
-);
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
 camera.position.set(10, 7, 12);
 camera.lookAt(0, 1.8, 0);
 
@@ -137,17 +134,6 @@ let gaTransitioning = false;
 let audioReady = false;
 let lastClickTime = null;
 
-/* --- GA 平均 speed (0~5) --- */
-function getAgentSpeedValueFromGA() {
-  if (!ga || typeof ga.getPopulation !== "function") return 2.5;
-  const pop = ga.getPopulation() || [];
-  if (!pop.length) return 2.5;
-
-  let sum = 0;
-  for (const g of pop) sum += g.baseSpeed ?? 0;
-  return THREE.MathUtils.clamp(sum / pop.length, 0, 5);
-}
-
 /* ───────── 音效：吸引生物用水滴聲（點擊節奏）───────── */
 /** ⚠️ 完全不改 */
 function playAgentSoundFromValue(value) {
@@ -210,15 +196,18 @@ function ensureAgentAmbientSound() {
 
   const reverb = new Tone.Reverb({ decay: 1.1, wet: 0.14 });
 
-  const grassGain = new Tone.Gain(0.09);
-  const thumpGain = new Tone.Gain(0.04);
+  // ✅ 你要改腳步聲大小：就調這兩個 Gain
+  const grassGain = new Tone.Gain(0.12);
+  const thumpGain = new Tone.Gain(0.08);
 
   grassNoise.chain(hp, grassBP, grassGain, reverb, Tone.Destination);
   stepThump.chain(thumpLP, thumpGain, reverb);
 
   agentAmbientLoop = new Tone.Loop((time) => {
-    const v = getAgentSpeedValueFromGA();
+    // ✅ 用 runtime 實際速度（更符合「跟滑鼠跑」）
+    const v = getRuntimeAvgSpeed01to05 ? getRuntimeAvgSpeed01to05() : 0; // 0~5
 
+    // ✅ 節奏（越快越密）：要改節奏就改 baseInterval/minInterval
     const baseInterval = 1.05;
     const minInterval = 0.28;
     const interval = baseInterval - (baseInterval - minInterval) * (v / 5);
@@ -228,6 +217,7 @@ function ensureAgentAmbientSound() {
     grassGain.gain.rampTo(0.07 + 0.06 * (v / 5), 0.15);
     thumpGain.gain.rampTo(0.03 + 0.03 * (v / 5), 0.15);
 
+    // 一次 loop 觸發 2~4 個「踩草步」
     const steps = 2 + Math.floor(Math.random() * 3);
     const gap = interval / (steps * 2.0);
 
@@ -258,114 +248,93 @@ let windGain = null;
 let windReverb = null;
 
 // LFOs / schedulers
-let windBreathLFO = null;     // 아주 느린 "호흡" (볼륨)
-let windColorLFO = null;      // 아주 느린 "색" (필터)
-let windPanLFO = null;        // 아주 느린 "방향"
-let windGustLoop = null;      // 가끔 아주 살짝 불어오는 미풍
+let windBreathLFO = null;
+let windColorLFO = null;
+let windPanLFO = null;
+let windGustLoop = null;
 let windUpdateAcc = 0;
 
 function ensureWindSound() {
   if (!Tone || windStarted) return;
   windStarted = true;
 
-  // 1) 더 부드러운 바람: brown noise (핑크보다 더 '포근')
   windNoise = new Tone.Noise("brown");
   windNoise.start();
 
-  // 2) 숲의 공기: 과한 고역/저역을 정리하고,
-  //    중역(잎사귀 스침) 대역을 살짝 강조
   windHP = new Tone.Filter({ type: "highpass", frequency: 120, rolloff: -12 });
   windBP = new Tone.Filter({ type: "bandpass", frequency: 900, Q: 0.7 });
   windLP = new Tone.Filter({ type: "lowpass", frequency: 1800, rolloff: -12 });
 
-  // 3) 아주 살짝 움직이는 방향감
   windPan = new Tone.Panner(0);
 
-  // 4) 전체 볼륨: 더 작고 편안하게
+  // ✅ 바람 기본 크기(전체 볼륨)
   windGain = new Tone.Gain(0.008);
 
-  // 5) 숲 공간감: 긴 리버브는 피하고, 맑고 얕게
   windReverb = new Tone.Reverb({ decay: 1.8, wet: 0.12 });
 
   windNoise.chain(windHP, windBP, windLP, windPan, windGain, windReverb, Tone.Destination);
 
-  // ── LFO: "숨 쉬는" 느낌 (볼륨이 아주 천천히 오르내림)
-  windBreathLFO = new Tone.LFO({
-    frequency: 0.045, // 매우 느림
-    min: 0.75,
-    max: 1.10,
-  }).start();
+  windBreathLFO = new Tone.LFO({ frequency: 0.045, min: 0.75, max: 1.10 }).start();
   windBreathLFO.connect(windGain.gain);
 
-  // ── LFO: "공기 온도/향" 느낌 (필터가 아주 천천히 변함)
-  windColorLFO = new Tone.LFO({
-    frequency: 0.03,
-    min: 850,
-    max: 1450,
-  }).start();
+  windColorLFO = new Tone.LFO({ frequency: 0.03, min: 850, max: 1450 }).start();
   windColorLFO.connect(windBP.frequency);
 
-  // ── LFO: "바람 방향" (아주 천천히 좌우)
-  windPanLFO = new Tone.LFO({
-    frequency: 0.02,
-    min: -0.35,
-    max: 0.35,
-  }).start();
+  windPanLFO = new Tone.LFO({ frequency: 0.02, min: -0.35, max: 0.35 }).start();
   windPanLFO.connect(windPan.pan);
 
-  // ── 아주 가끔 '미풍' (gust) : 세게 튀지 않게, 아주 조금만
-  windGustLoop = new Tone.Loop((time) => {
-    // 살짝만 볼륨/밝기 변화 (편안한 레벨)
+  windGustLoop = new Tone.Loop(() => {
     const gainNow = windGain.gain.value;
-    windGain.gain.rampTo(Math.max(0.004, Math.min(0.02, gainNow * (0.92 + Math.random() * 0.14))), 2.2);
+    windGain.gain.rampTo(
+      Math.max(0.004, Math.min(0.02, gainNow * (0.92 + Math.random() * 0.14))),
+      2.2
+    );
 
     const lpNow = windLP.frequency.value;
-    windLP.frequency.rampTo(Math.max(1200, Math.min(2600, lpNow * (0.95 + Math.random() * 0.18))), 2.5);
+    windLP.frequency.rampTo(
+      Math.max(1200, Math.min(2600, lpNow * (0.95 + Math.random() * 0.18))),
+      2.5
+    );
   }, 6.0);
   windGustLoop.start(0);
 
-  if (Tone.Transport.state !== "started") {
-    Tone.Transport.start();
-  }
+  if (Tone.Transport.state !== "started") Tone.Transport.start();
 }
 
 /**
- * envValue(0~5): 생태계 활동/바람 세기처럼 사용
- * - 값이 커질수록: 조금 더 밝고(필터), 약간 더 존재감(볼륨), gust 더 잦음
- * - 변화는 전부 rampTo로 "부드럽게"
+ * envValue(0~5) = "현재 실제 이동(활동) 정도"
+ * - 움직임이 적으면: 바람이 조용하고 느리게
+ * - 마우스 따라 활발하면: 바람이 또렷하고 조금 더 빨라짐
  */
 function updateEnvironmentSound(envValue, dt = 0.016) {
   if (!Tone || !windStarted) return;
 
-  // 너무 자주 만지면 지저분해질 수 있으니 약간만 절제
   windUpdateAcc += dt;
   if (windUpdateAcc < 0.18) return;
   windUpdateAcc = 0;
 
-  const v = THREE.MathUtils.clamp(envValue ?? 2.5, 0, 5);
+  const v = THREE.MathUtils.clamp(envValue ?? 0, 0, 5);
   const t = v / 5;
 
-  // ✅ 전체 볼륨: 더 편안한 범위
-  // (바람 존재감은 있지만 "배경"으로 남게)
-  const baseGain = 0.006 + 0.010 * t; // 0.006~0.016
+  // ✅ 볼륨 (움직일수록 더 분명)
+  const baseGain = 0.004 + 0.018 * t; // 0.004~0.022
   windGain.gain.rampTo(baseGain, 1.0);
 
-  // ✅ 바람의 "맑음/청량": 너무 날카롭지 않게 상한 제한
-  const lpCut = 1500 + 900 * t; // 1500~2400
+  // ✅ 밝기 (움직일수록 더 "청량")
+  const lpCut = 1400 + 1100 * t; // 1400~2500
   windLP.frequency.rampTo(lpCut, 1.2);
 
-  // ✅ 잎사귀 대역(밴드패스): 조금만 위로
-  const bpCut = 800 + 400 * t; // 800~1200
+  // ✅ 잎사귀 대역
+  const bpCut = 780 + 520 * t; // 780~1300
   windBP.frequency.rampTo(bpCut, 1.4);
 
-  // ✅ "호흡" 속도: 활동적일수록 조금 더 빠르게 (그래도 느리게)
-  const breathRate = 0.035 + 0.035 * t; // 0.035~0.07
+  // ✅ 바람 호흡 속도 (움직일수록 조금 더 빠르게)
+  const breathRate = 0.03 + 0.06 * t; // 0.03~0.09
   windBreathLFO.frequency.rampTo(breathRate, 2.0);
 
-  // ✅ gust 간격: 바빠질수록 조금 더 자주
-  windGustLoop.interval = 7.5 - 2.5 * t; // 7.5~5.0
+  // ✅ gust 빈도 (움직일수록 더 자주)
+  windGustLoop.interval = 8.0 - 4.5 * t; // 8.0~3.5
 }
-
 
 /* ───────── 初始化 ───────── */
 async function init() {
@@ -570,6 +539,9 @@ window.addEventListener("keydown", (e) => {
 /* ───────── Loop ───────── */
 const clock = new THREE.Clock();
 
+// ✅ NEW: 바람 env smoothing (부드러운 커브)
+let windEnvSmoothed = 0;
+
 function update(dt) {
   if (terrainRoot) updateTerrainTime(terrainRoot, dt);
 
@@ -586,9 +558,15 @@ function update(dt) {
     }
   }
 
-  // ✅ 重要：只有「音訊已解鎖」才更新風聲（避免任何初始化順序問題）
+  // ✅ 핵심: "실제 이동" 기반으로 바람이 커졌다/작아졌다
   if (audioReady) {
-    updateEnvironmentSound(getAgentSpeedValueFromGA(), dt);
+    const env = getRuntimeAvgSpeed01to05 ? getRuntimeAvgSpeed01to05() : 0; // 0~5
+
+    // smoothing (더 느리게/더 빠르게 조절 가능)
+    const SMOOTH = 0.055; // 👈 더 부드럽게: 0.03 / 더 민감하게: 0.10
+    windEnvSmoothed += (env - windEnvSmoothed) * (1 - Math.pow(1 - SMOOTH, dt * 60));
+
+    updateEnvironmentSound(windEnvSmoothed, dt);
   }
 }
 
