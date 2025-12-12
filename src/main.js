@@ -98,17 +98,14 @@ function findRandomPointOnTerrain(terrain, tries = 140) {
 }
 function findHighestPointOnTerrain(terrain, samples = 560) {
   const box = new THREE.Box3().setFromObject(terrain);
-  const min = box.min,
-    max = box.max;
+  const min = box.min, max = box.max;
   let best = null;
   for (let i = 0; i < samples; i++) {
     const x = THREE.MathUtils.lerp(min.x, max.x, Math.random());
     const z = THREE.MathUtils.lerp(min.z, max.z, Math.random());
     const h = rayDownYToTerrain(terrain, x, z, max.y + 300);
     if (!h) continue;
-    if (!best || h.point.y > best.point.y) {
-      best = { point: h.point.clone() };
-    }
+    if (!best || h.point.y > best.point.y) best = { point: h.point.clone() };
   }
   return best ? best.point : new THREE.Vector3(0, 0, 0);
 }
@@ -123,16 +120,252 @@ let autoSpawnTick = 0;
 /* ───────── GA 狀態 ───────── */
 const GA_CONFIG = {
   populationSize: 40,
-  survivalRate: SURVIVAL_RATE, // 0.4
+  survivalRate: SURVIVAL_RATE,
   mutationRate: 0.15,
   crossoverRate: 0.9,
 };
 
 let ga = null;
 let gaAutoRun = true;
-let gaGenerationDuration = 10.0; // 秒
+let gaGenerationDuration = 10.0;
 let gaTimer = 0;
 let gaTransitioning = false;
+
+/* ─────────────────────────────────────────────────────────
+   AUDIO STATE (放在 update() 之前，避免 TDZ)
+───────────────────────────────────────────────────────── */
+let audioReady = false;
+let lastClickTime = null;
+
+/* --- GA 平均 speed (0~5) --- */
+function getAgentSpeedValueFromGA() {
+  if (!ga || typeof ga.getPopulation !== "function") return 2.5;
+  const pop = ga.getPopulation() || [];
+  if (!pop.length) return 2.5;
+
+  let sum = 0;
+  for (const g of pop) sum += g.baseSpeed ?? 0;
+  return THREE.MathUtils.clamp(sum / pop.length, 0, 5);
+}
+
+/* ───────── 音效：吸引生物用水滴聲（點擊節奏）───────── */
+/** ⚠️ 完全不改 */
+function playAgentSoundFromValue(value) {
+  if (!Tone) return;
+
+  const v = Math.max(0, Math.min(5, value));
+
+  const minFreq = 900;
+  const maxFreq = 2000;
+  const freq = minFreq + (maxFreq - minFreq) * (v / 5);
+
+  const cutoff = 800 + 2400 * (v / 5);
+
+  const dur = 0.18 - 0.12 * (v / 5);
+
+  const synth = new Tone.MembraneSynth({
+    pitchDecay: 0.005,
+    octaves: 2,
+    envelope: {
+      attack: 0.005,
+      decay: dur,
+      sustain: 0.0,
+      release: 0.05,
+    },
+  });
+
+  const filter = new Tone.Filter({
+    type: "lowpass",
+    frequency: cutoff,
+    rolloff: -24,
+  });
+
+  synth.connect(filter).toDestination();
+  synth.triggerAttackRelease(freq, dur, Tone.now());
+}
+
+/* ───────── 音效：踩草（生物移動）───────── */
+let agentAmbientStarted = false;
+let agentAmbientLoop = null;
+
+function ensureAgentAmbientSound() {
+  if (!Tone || agentAmbientStarted) return;
+  agentAmbientStarted = true;
+
+  const grassNoise = new Tone.NoiseSynth({
+    noise: { type: "pink" },
+    envelope: { attack: 0.001, decay: 0.09, sustain: 0.0, release: 0.04 },
+  });
+
+  const hp = new Tone.Filter({ type: "highpass", frequency: 650, rolloff: -24 });
+  const grassBP = new Tone.Filter({ type: "bandpass", frequency: 1600, Q: 1.8 });
+
+  const stepThump = new Tone.MembraneSynth({
+    pitchDecay: 0.02,
+    octaves: 1.2,
+    envelope: { attack: 0.001, decay: 0.07, sustain: 0.0, release: 0.02 },
+  });
+
+  const thumpLP = new Tone.Filter({ type: "lowpass", frequency: 280, rolloff: -24 });
+
+  const reverb = new Tone.Reverb({ decay: 1.1, wet: 0.14 });
+
+  const grassGain = new Tone.Gain(0.09);
+  const thumpGain = new Tone.Gain(0.04);
+
+  grassNoise.chain(hp, grassBP, grassGain, reverb, Tone.Destination);
+  stepThump.chain(thumpLP, thumpGain, reverb);
+
+  agentAmbientLoop = new Tone.Loop((time) => {
+    const v = getAgentSpeedValueFromGA();
+
+    const baseInterval = 1.05;
+    const minInterval = 0.28;
+    const interval = baseInterval - (baseInterval - minInterval) * (v / 5);
+    agentAmbientLoop.interval = interval;
+
+    grassBP.frequency.rampTo(1350 + 1500 * (v / 5), 0.12);
+    grassGain.gain.rampTo(0.07 + 0.06 * (v / 5), 0.15);
+    thumpGain.gain.rampTo(0.03 + 0.03 * (v / 5), 0.15);
+
+    const steps = 2 + Math.floor(Math.random() * 3);
+    const gap = interval / (steps * 2.0);
+
+    for (let i = 0; i < steps; i++) {
+      const t = time + i * gap + Math.random() * 0.02;
+      grassNoise.triggerAttackRelease(0.035, t);
+
+      const thumpFreq = 95 + 55 * (v / 5) + (Math.random() - 0.5) * 10;
+      stepThump.triggerAttackRelease(thumpFreq, 0.05, t + 0.004);
+    }
+  }, 1.0);
+
+  agentAmbientLoop.start(0);
+
+  if (Tone.Transport.state !== "started") Tone.Transport.start();
+}
+
+/* ───────── 환경 기반 사운드: Gentle Forest Breeze (background) ───────── */
+let windStarted = false;
+
+// Tone nodes
+let windNoise = null;
+let windHP = null;
+let windBP = null;
+let windLP = null;
+let windPan = null;
+let windGain = null;
+let windReverb = null;
+
+// LFOs / schedulers
+let windBreathLFO = null;     // 아주 느린 "호흡" (볼륨)
+let windColorLFO = null;      // 아주 느린 "색" (필터)
+let windPanLFO = null;        // 아주 느린 "방향"
+let windGustLoop = null;      // 가끔 아주 살짝 불어오는 미풍
+let windUpdateAcc = 0;
+
+function ensureWindSound() {
+  if (!Tone || windStarted) return;
+  windStarted = true;
+
+  // 1) 더 부드러운 바람: brown noise (핑크보다 더 '포근')
+  windNoise = new Tone.Noise("brown");
+  windNoise.start();
+
+  // 2) 숲의 공기: 과한 고역/저역을 정리하고,
+  //    중역(잎사귀 스침) 대역을 살짝 강조
+  windHP = new Tone.Filter({ type: "highpass", frequency: 120, rolloff: -12 });
+  windBP = new Tone.Filter({ type: "bandpass", frequency: 900, Q: 0.7 });
+  windLP = new Tone.Filter({ type: "lowpass", frequency: 1800, rolloff: -12 });
+
+  // 3) 아주 살짝 움직이는 방향감
+  windPan = new Tone.Panner(0);
+
+  // 4) 전체 볼륨: 더 작고 편안하게
+  windGain = new Tone.Gain(0.008);
+
+  // 5) 숲 공간감: 긴 리버브는 피하고, 맑고 얕게
+  windReverb = new Tone.Reverb({ decay: 1.8, wet: 0.12 });
+
+  windNoise.chain(windHP, windBP, windLP, windPan, windGain, windReverb, Tone.Destination);
+
+  // ── LFO: "숨 쉬는" 느낌 (볼륨이 아주 천천히 오르내림)
+  windBreathLFO = new Tone.LFO({
+    frequency: 0.045, // 매우 느림
+    min: 0.75,
+    max: 1.10,
+  }).start();
+  windBreathLFO.connect(windGain.gain);
+
+  // ── LFO: "공기 온도/향" 느낌 (필터가 아주 천천히 변함)
+  windColorLFO = new Tone.LFO({
+    frequency: 0.03,
+    min: 850,
+    max: 1450,
+  }).start();
+  windColorLFO.connect(windBP.frequency);
+
+  // ── LFO: "바람 방향" (아주 천천히 좌우)
+  windPanLFO = new Tone.LFO({
+    frequency: 0.02,
+    min: -0.35,
+    max: 0.35,
+  }).start();
+  windPanLFO.connect(windPan.pan);
+
+  // ── 아주 가끔 '미풍' (gust) : 세게 튀지 않게, 아주 조금만
+  windGustLoop = new Tone.Loop((time) => {
+    // 살짝만 볼륨/밝기 변화 (편안한 레벨)
+    const gainNow = windGain.gain.value;
+    windGain.gain.rampTo(Math.max(0.004, Math.min(0.02, gainNow * (0.92 + Math.random() * 0.14))), 2.2);
+
+    const lpNow = windLP.frequency.value;
+    windLP.frequency.rampTo(Math.max(1200, Math.min(2600, lpNow * (0.95 + Math.random() * 0.18))), 2.5);
+  }, 6.0);
+  windGustLoop.start(0);
+
+  if (Tone.Transport.state !== "started") {
+    Tone.Transport.start();
+  }
+}
+
+/**
+ * envValue(0~5): 생태계 활동/바람 세기처럼 사용
+ * - 값이 커질수록: 조금 더 밝고(필터), 약간 더 존재감(볼륨), gust 더 잦음
+ * - 변화는 전부 rampTo로 "부드럽게"
+ */
+function updateEnvironmentSound(envValue, dt = 0.016) {
+  if (!Tone || !windStarted) return;
+
+  // 너무 자주 만지면 지저분해질 수 있으니 약간만 절제
+  windUpdateAcc += dt;
+  if (windUpdateAcc < 0.18) return;
+  windUpdateAcc = 0;
+
+  const v = THREE.MathUtils.clamp(envValue ?? 2.5, 0, 5);
+  const t = v / 5;
+
+  // ✅ 전체 볼륨: 더 편안한 범위
+  // (바람 존재감은 있지만 "배경"으로 남게)
+  const baseGain = 0.006 + 0.010 * t; // 0.006~0.016
+  windGain.gain.rampTo(baseGain, 1.0);
+
+  // ✅ 바람의 "맑음/청량": 너무 날카롭지 않게 상한 제한
+  const lpCut = 1500 + 900 * t; // 1500~2400
+  windLP.frequency.rampTo(lpCut, 1.2);
+
+  // ✅ 잎사귀 대역(밴드패스): 조금만 위로
+  const bpCut = 800 + 400 * t; // 800~1200
+  windBP.frequency.rampTo(bpCut, 1.4);
+
+  // ✅ "호흡" 속도: 활동적일수록 조금 더 빠르게 (그래도 느리게)
+  const breathRate = 0.035 + 0.035 * t; // 0.035~0.07
+  windBreathLFO.frequency.rampTo(breathRate, 2.0);
+
+  // ✅ gust 간격: 바빠질수록 조금 더 자주
+  windGustLoop.interval = 7.5 - 2.5 * t; // 7.5~5.0
+}
+
 
 /* ───────── 初始化 ───────── */
 async function init() {
@@ -151,13 +384,9 @@ async function init() {
     scene.add(characterObjGroup);
     const prototypeNode = (characterObjGroup.children?.[0]) || characterObjGroup;
 
-    /* 1) GA 初始化 */
-    ga = new GeneticAlgorithm({
-      ...GA_CONFIG,
-    });
+    ga = new GeneticAlgorithm({ ...GA_CONFIG });
     const initialPop = ga.initPopulation();
 
-    /* 2) ThermoBug (Boids) 初始化 + 初始 Genome 反映 */
     initBoids({
       scene,
       camera,
@@ -168,18 +397,13 @@ async function init() {
       initialGenomes: initialPop,
     });
 
-    /* 3) L-System 植物 */
     spawnPlantsOnTerrain({ count: INITIAL_PLANT_COUNT, oneOnPeak: true });
     plants.forEach((p) => p.update(0));
 
-    /* 4) UI */
     setupUI();
     updateGAHud();
 
-    /* 5) 啟動 Loop */
     update(0);
-
-    /* 6) 點擊節奏 → 水滴聲（不改） */
     setupAgentClickSoundRhythm();
   } catch (err) {
     console.error("[main] 初始化錯誤：", err);
@@ -194,17 +418,14 @@ function scalePlantByCharacter(p) {
   const targetH = charH * MIN_SCALE_BY_CHAR;
   const plantH = p.estimateHeight();
   let s = plantH > 0 ? targetH / plantH : MIN_SCALE_BY_CHAR;
-  s *= THREE.MathUtils.lerp(
-    RANDOM_SCALE_JITTER[0],
-    RANDOM_SCALE_JITTER[1],
-    Math.random()
-  );
+  s *= THREE.MathUtils.lerp(RANDOM_SCALE_JITTER[0], RANDOM_SCALE_JITTER[1], Math.random());
   p.object3d.scale.setScalar(s);
   p.object3d.rotation.y = Math.random() * Math.PI * 2;
 }
 
 function spawnPlantsOnTerrain({ count = 12, oneOnPeak = false } = {}) {
   if (!terrainRoot) return;
+
   if (oneOnPeak) {
     const peak = findHighestPointOnTerrain(terrainRoot, 520);
     const plant = new LSystemPlant({
@@ -223,11 +444,12 @@ function spawnPlantsOnTerrain({ count = 12, oneOnPeak = false } = {}) {
     scalePlantByCharacter(plant);
     plants.push(plant);
   }
+
   for (let i = 0; i < count; i++) {
     const pos = findRandomPointOnTerrain(terrainRoot);
     const plant = new LSystemPlant({
       seed: Math.floor(Math.random() * 1e9),
-      genMax: 4 + Math.floor(Math.random() * 2), // 4~5 層
+      genMax: 4 + Math.floor(Math.random() * 2),
       step: 0.8 + Math.random() * 0.25,
       baseRadius: 0.18 + Math.random() * 0.1,
       angleDeg: 22 + Math.random() * 18,
@@ -243,26 +465,13 @@ function spawnPlantsOnTerrain({ count = 12, oneOnPeak = false } = {}) {
   }
 }
 
-/* 🔆 控制所有樹的發光亮度：Z 降低，X 提高 */
-function changeGlowFactor(scale) {
-  plants.forEach((p) => {
-    if (typeof p.getGlowFactor === "function" && typeof p.setGlowFactor === "function") {
-      const current = p.getGlowFactor();
-      p.setGlowFactor(current * scale);
-    }
-  });
-}
-
-/* 無限成長：持續 +1 代並定期增新樹 */
+/* 無限成長 */
 function startInfiniteGrow(ms = INFINITE_GROW_INTERVAL_MS) {
   if (infiniteGrowTimer) return;
   infiniteGrowTimer = setInterval(() => {
     plants.forEach((p) => p.addGen(+1));
     autoSpawnTick++;
-    if (
-      autoSpawnTick % AUTO_SPAWN_EVERY_N_TICKS === 0 &&
-      plants.length < AUTO_SPAWN_MAX
-    ) {
+    if (autoSpawnTick % AUTO_SPAWN_EVERY_N_TICKS === 0 && plants.length < AUTO_SPAWN_MAX) {
       spawnPlantsOnTerrain({ count: 1, oneOnPeak: false });
     }
     setGrowButtonState(true);
@@ -280,7 +489,7 @@ function toggleInfiniteGrow() {
   else startInfiniteGrow();
 }
 
-/* ───────── GA Loop 控制 ───────── */
+/* GA Loop */
 function triggerNextGeneration() {
   if (!ga || gaTransitioning) return;
 
@@ -323,6 +532,7 @@ function updateGAHud() {
       avgScale += g.bodyScale ?? 0;
       avgSpeed += g.baseSpeed ?? 0;
     });
+
     const n = pop.length || 1;
     avgScale /= n;
     avgSpeed /= n;
@@ -334,66 +544,22 @@ function updateGAHud() {
   }
 }
 
-/* ───────── 事件 ───────── */
+/* resize */
 window.addEventListener("resize", () => {
-  const w = window.innerWidth,
-    h = window.innerHeight;
+  const w = window.innerWidth, h = window.innerHeight;
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
   renderer.setSize(w, h);
   composer.setSize(w, h);
 });
 
+/* key */
 window.addEventListener("keydown", (e) => {
   switch (e.key) {
-    case " ":
-      plants.forEach((p) => p.togglePlay());
-      break;
-    case "[":
-      plants.forEach((p) => p.addGen(-1));
-      break;
-    case "]":
-    case "+":
-    case "=":
-      plants.forEach((p) => p.addGen(+1));
-      break;
-
-    // 樹的角度
-    case "j":
-    case "J":
-      plants.forEach((p) => p.addAngle(-2));
-      break;
-    case "k":
-    case "K":
-      plants.forEach((p) => p.addAngle(+2));
-      break;
-
-    case "n":
-    case "N":
-      plants.forEach((p) => p.addDecay(+0.03));
-      break;
-    case "m":
-    case "M":
-      plants.forEach((p) => p.addDecay(-0.03));
-      break;
-
-    // 無限成長(G)
     case "g":
     case "G":
       toggleInfiniteGrow();
       break;
-
-    // 🔅 變暗 / 🔆 變亮
-    case "z":
-    case "Z":
-      changeGlowFactor(0.8);
-      break;
-    case "x":
-    case "X":
-      changeGlowFactor(1.25);
-      break;
-
-    // 手動下一代 (H)
     case "h":
     case "H":
       triggerNextGeneration();
@@ -406,11 +572,12 @@ const clock = new THREE.Clock();
 
 function update(dt) {
   if (terrainRoot) updateTerrainTime(terrainRoot, dt);
+
   const tSec = performance.now() * 0.001;
   updateBoids(dt, tSec);
+
   plants.forEach((p) => p.update(dt));
 
-  // GA auto-run
   if (ga && gaAutoRun && !gaTransitioning) {
     gaTimer += dt;
     if (gaTimer >= gaGenerationDuration) {
@@ -419,8 +586,10 @@ function update(dt) {
     }
   }
 
-  // ✅ update 裡面不自動出聲
-  // 只有點擊時才會透過 setupAgentClickSoundRhythm() 觸發 playAgentSoundFromValue()
+  // ✅ 重要：只有「音訊已解鎖」才更新風聲（避免任何初始化順序問題）
+  if (audioReady) {
+    updateEnvironmentSound(getAgentSpeedValueFromGA(), dt);
+  }
 }
 
 (function animate() {
@@ -431,202 +600,21 @@ function update(dt) {
   composer.render();
 })();
 
-/* ───────── UI ───────── */
+/* UI */
 function setupUI() {
-  // 植物無限成長控制
   const btn = document.getElementById("btn-grow");
   const stop = document.getElementById("btn-stop");
   btn?.addEventListener("click", () => toggleInfiniteGrow());
   stop?.addEventListener("click", () => stopInfiniteGrow());
-
-  const dim = document.getElementById("btn-dim");
-  const bright = document.getElementById("btn-bright");
-  dim?.addEventListener("click", () => changeGlowFactor(0.8));
-  bright?.addEventListener("click", () => changeGlowFactor(1.25));
-
-  // GA 控制用:
-  const btnNext = document.getElementById("ga-next");
-  const chkAuto = document.getElementById("ga-auto");
-  const sliderDur = document.getElementById("ga-duration");
-  const durLabel = document.getElementById("ga-duration-label");
-
-  btnNext?.addEventListener("click", () => {
-    gaAutoRun = false;
-    if (chkAuto) chkAuto.checked = false;
-    triggerNextGeneration();
-  });
-
-  if (chkAuto) {
-    chkAuto.checked = gaAutoRun;
-    chkAuto.addEventListener("change", (e) => {
-      gaAutoRun = !!e.target.checked;
-    });
-  }
-
-  if (sliderDur) {
-    sliderDur.value = String(gaGenerationDuration);
-    const updateLabel = () => {
-      if (durLabel) durLabel.textContent = `${sliderDur.value} s`;
-    };
-    updateLabel();
-    sliderDur.addEventListener("input", () => {
-      gaGenerationDuration = parseFloat(sliderDur.value) || 10;
-      updateLabel();
-    });
-  }
 }
 
-/* ───────── 音效：吸引生物用水滴聲（點擊節奏）───────── */
-/**
- * ⚠️ 這段依你的要求：完全不更改
- * - 點擊越快 → value 越高 → 水滴越高、越亮、越短
- */
-function playAgentSoundFromValue(value) {
-  if (!Tone) return;
-
-  const v = Math.max(0, Math.min(5, value));
-
-  const minFreq = 900;
-  const maxFreq = 2000;
-  const freq = minFreq + (maxFreq - minFreq) * (v / 5);
-
-  const cutoff = 800 + 2400 * (v / 5);
-
-  const dur = 0.18 - 0.12 * (v / 5); // 0.18 → 0.06 秒
-
-  const synth = new Tone.MembraneSynth({
-    pitchDecay: 0.005,
-    octaves: 2,
-    envelope: {
-      attack: 0.005,
-      decay: dur,
-      sustain: 0.0,
-      release: 0.05,
-    },
-  });
-
-  const filter = new Tone.Filter({
-    type: "lowpass",
-    frequency: cutoff,
-    rolloff: -24,
-  });
-
-  synth.connect(filter).toDestination();
-
-  const now = Tone.now();
-  synth.triggerAttackRelease(freq, dur, now);
+function setGrowButtonState(active) {
+  const btn = document.getElementById("btn-grow");
+  if (!btn) return;
+  btn.textContent = active ? "⏸ 停止無限成長 (G)" : "▶ 無限成長 (G)";
 }
 
-let audioReady = false;
-let lastClickTime = null;
-
-/* ───────── 音效：生物自己的環境音（GA → grass-steps）───────── */
-
-// 全域環境音狀態
-let agentAmbientStarted = false;
-let agentAmbientLoop = null;
-let agentAmbientSynth = null;
-let agentAmbientFilter = null;
-
-function getAgentSpeedValueFromGA() {
-  if (!ga || typeof ga.getPopulation !== "function") return 2.5;
-
-  const pop = ga.getPopulation() || [];
-  if (!pop.length) return 2.5;
-
-  let sum = 0;
-  for (const g of pop) sum += g.baseSpeed ?? 0;
-  let avg = sum / pop.length;
-
-  avg = THREE.MathUtils.clamp(avg, 0, 5);
-  return avg;
-}
-
-/**
- * ✅ 草原走路的沙沙環境音（只改這裡）
- * - 很小聲的噪音刷刷
- * - 跟 GA 平均 baseSpeed 連動（越快越密、越亮）
- * - 重要：NoiseSynth.triggerAttackRelease() 使用「秒數」避免炸掉造成沒畫面
- */
-function ensureAgentAmbientSound() {
-  if (!Tone || agentAmbientStarted) return;
-  agentAmbientStarted = true;
-
-  // 沙沙聲主體：噪音（像草地摩擦）
-  agentAmbientSynth = new Tone.NoiseSynth({
-    noise: { type: "pink" },
-    envelope: {
-      attack: 0.001,
-      decay: 0.08,
-      sustain: 0.0,
-      release: 0.03,
-    },
-  });
-
-  // 去低頻，避免隆隆
-  const hp = new Tone.Filter({
-    type: "highpass",
-    frequency: 700,
-    rolloff: -24,
-  });
-
-  // 聚焦沙沙頻段
-  agentAmbientFilter = new Tone.Filter({
-    type: "bandpass",
-    frequency: 1400,
-    Q: 1.4,
-  });
-
-  const reverb = new Tone.Reverb({
-    decay: 1.2,
-    wet: 0.18,
-  });
-
-  // 很小聲（你要的）
-  const gain = new Tone.Gain(0.08);
-
-  agentAmbientSynth.chain(hp, agentAmbientFilter, reverb, gain, Tone.Destination);
-
-  agentAmbientLoop = new Tone.Loop((time) => {
-    const v = getAgentSpeedValueFromGA(); // 0~5
-
-    // 越快越密
-    const baseInterval = 1.1;
-    const minInterval = 0.35;
-    const interval = baseInterval - (baseInterval - minInterval) * (v / 5);
-    agentAmbientLoop.interval = interval;
-
-    // 越快稍微亮一點 & 稍微大聲一點（幅度克制）
-    const bright = 1100 + 1200 * (v / 5); // 1100~2300
-    agentAmbientFilter.frequency.rampTo(bright, 0.12);
-
-    const vol = 0.06 + 0.05 * (v / 5); // 0.06~0.11
-    gain.gain.rampTo(vol, 0.15);
-
-    // 一次 loop 刷 2~4 下
-    const strokes = 2 + Math.floor(Math.random() * 3); // 2~4
-    const gap = interval / (strokes * 2.2);
-
-    for (let i = 0; i < strokes; i++) {
-      const t = time + i * gap + Math.random() * 0.02;
-
-      // 微抖動讓草更自然
-      const jitter = (Math.random() - 0.5) * 250; // ±125Hz
-      agentAmbientFilter.frequency.setValueAtTime(bright + jitter, t);
-
-      // ✅ 重要：用「秒數」！不要用 "32n" 之類字串（會炸掉導致沒畫面）
-      agentAmbientSynth.triggerAttackRelease(0.03, t);
-    }
-  }, 1.0);
-
-  agentAmbientLoop.start(0);
-
-  if (Tone.Transport.state !== "started") {
-    Tone.Transport.start();
-  }
-}
-
-/* ───────── 吸引生物的點擊音效初始化 ───────── */
+/* 點擊解鎖音訊 + 水滴 + 啟動踩草 + 啟動風聲 */
 function setupAgentClickSoundRhythm() {
   if (!Tone) return;
 
@@ -637,37 +625,29 @@ function setupAgentClickSoundRhythm() {
         await Tone.getContext().resume();
         audioReady = true;
 
-        // 第一次解鎖 audio 時，啟動「生物移動的草原沙沙環境音」
         ensureAgentAmbientSound();
+        ensureWindSound();
       }
 
       const now = Tone.now();
-
       let speedValue = 2.5;
 
       if (lastClickTime !== null) {
-        const delta = now - lastClickTime; // 秒
+        const delta = now - lastClickTime;
         const MIN_DELTA = 0.1;
         const MAX_DELTA = 1.2;
 
         const clamped = Math.max(MIN_DELTA, Math.min(MAX_DELTA, delta));
         const t = (clamped - MIN_DELTA) / (MAX_DELTA - MIN_DELTA);
-
         speedValue = (1 - t) * 5;
       }
 
       lastClickTime = now;
 
-      // ✅ 點擊聲：不改（仍是水滴）
+      // ✅ 點擊水滴聲：不改
       playAgentSoundFromValue(speedValue);
     } catch (err) {
       console.error("[audio] Tone.js 點擊音效啟動失敗：", err);
     }
   });
-}
-
-function setGrowButtonState(active) {
-  const btn = document.getElementById("btn-grow");
-  if (!btn) return;
-  btn.textContent = active ? "⏸ 停止無限成長 (G)" : "▶ 無限成長 (G)";
 }
