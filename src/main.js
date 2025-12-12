@@ -126,7 +126,6 @@ const GA_CONFIG = {
   survivalRate: SURVIVAL_RATE, // 0.4
   mutationRate: 0.15,
   crossoverRate: 0.9,
-  // 這裡不再傳 slotPatternIds / lockPatternSlots
 };
 
 let ga = null;
@@ -152,8 +151,7 @@ async function init() {
     scene.add(characterObjGroup);
     const prototypeNode = (characterObjGroup.children?.[0]) || characterObjGroup;
 
-    /* 1) GA 初始化
-       Gen0：ga.js 內部會把全部 patternId 設為 initialPatternId (預設 0) */
+    /* 1) GA 初始化 */
     ga = new GeneticAlgorithm({
       ...GA_CONFIG,
     });
@@ -181,9 +179,7 @@ async function init() {
     /* 5) 啟動 Loop */
     update(0);
 
-    /* 6) 設定「用點擊控制節奏」的音效：
-       平常不出聲，只在點擊叫他們靠過來時發出水滴聲，
-       點擊越快 → 聲音節奏越快、音色越緊張。 */
+    /* 6) 點擊節奏 → 水滴聲（不改） */
     setupAgentClickSoundRhythm();
   } catch (err) {
     console.error("[main] 初始化錯誤：", err);
@@ -234,9 +230,9 @@ function spawnPlantsOnTerrain({ count = 12, oneOnPeak = false } = {}) {
       genMax: 4 + Math.floor(Math.random() * 2), // 4~5 層
       step: 0.8 + Math.random() * 0.25,
       baseRadius: 0.18 + Math.random() * 0.1,
-      angleDeg: 22 + Math.random() * 18, // 每棵角度不同
-      branchPerLevel: 3 + Math.floor(Math.random() * 3), // 3~5 根側枝
-      leafClusterCount: 4 + Math.floor(Math.random() * 4), // 4~7 葉
+      angleDeg: 22 + Math.random() * 18,
+      branchPerLevel: 3 + Math.floor(Math.random() * 3),
+      leafClusterCount: 4 + Math.floor(Math.random() * 4),
       leafSize: 1.1 + Math.random() * 0.6,
       glowFactor: 0.8 + Math.random() * 0.6,
     });
@@ -423,7 +419,7 @@ function update(dt) {
     }
   }
 
-  // ✅ 現在：update 裡面不自動出聲
+  // ✅ update 裡面不自動出聲
   // 只有點擊時才會透過 setupAgentClickSoundRhythm() 觸發 playAgentSoundFromValue()
 }
 
@@ -480,27 +476,22 @@ function setupUI() {
   }
 }
 
-/* ───────── 音效：speed → 水滴聲 ───────── */
-
+/* ───────── 音效：吸引生物用水滴聲（點擊節奏）───────── */
 /**
- * 這裡不再用「固定的物理 speed」，而是用「兩次點擊之間的時間間隔」來當作 speed。
- * 點擊越快 → 間隔越短 → 映射到越高的 value（0~5） → 聲音越高、越亮、越短。
+ * ⚠️ 這段依你的要求：完全不更改
+ * - 點擊越快 → value 越高 → 水滴越高、越亮、越短
  */
 function playAgentSoundFromValue(value) {
   if (!Tone) return;
 
-  // 確保在 0~5 之間
   const v = Math.max(0, Math.min(5, value));
 
-  // 1) Pitch mapping: C6 ~ C7 附近的水滴感頻率
   const minFreq = 900;
   const maxFreq = 2000;
   const freq = minFreq + (maxFreq - minFreq) * (v / 5);
 
-  // 2) 亮度：filter cutoff 跟著 speed 上升
   const cutoff = 800 + 2400 * (v / 5);
 
-  // 3) 持續時間：速度越快越短
   const dur = 0.18 - 0.12 * (v / 5); // 0.18 → 0.06 秒
 
   const synth = new Tone.MembraneSynth({
@@ -526,49 +517,148 @@ function playAgentSoundFromValue(value) {
   synth.triggerAttackRelease(freq, dur, now);
 }
 
-/* 
- * 點擊節奏 → 聲音節奏
- * - 不點擊：完全沒聲音
- * - 點擊一次：出現一顆水滴
- * - 點擊越快：因為間隔越短，所以映射的 value 越高 → 聲音越急促
- */
 let audioReady = false;
 let lastClickTime = null;
 
+/* ───────── 音效：生物自己的環境音（GA → grass-steps）───────── */
+
+// 全域環境音狀態
+let agentAmbientStarted = false;
+let agentAmbientLoop = null;
+let agentAmbientSynth = null;
+let agentAmbientFilter = null;
+
+function getAgentSpeedValueFromGA() {
+  if (!ga || typeof ga.getPopulation !== "function") return 2.5;
+
+  const pop = ga.getPopulation() || [];
+  if (!pop.length) return 2.5;
+
+  let sum = 0;
+  for (const g of pop) sum += g.baseSpeed ?? 0;
+  let avg = sum / pop.length;
+
+  avg = THREE.MathUtils.clamp(avg, 0, 5);
+  return avg;
+}
+
+/**
+ * ✅ 草原走路的沙沙環境音（只改這裡）
+ * - 很小聲的噪音刷刷
+ * - 跟 GA 平均 baseSpeed 連動（越快越密、越亮）
+ * - 重要：NoiseSynth.triggerAttackRelease() 使用「秒數」避免炸掉造成沒畫面
+ */
+function ensureAgentAmbientSound() {
+  if (!Tone || agentAmbientStarted) return;
+  agentAmbientStarted = true;
+
+  // 沙沙聲主體：噪音（像草地摩擦）
+  agentAmbientSynth = new Tone.NoiseSynth({
+    noise: { type: "pink" },
+    envelope: {
+      attack: 0.001,
+      decay: 0.08,
+      sustain: 0.0,
+      release: 0.03,
+    },
+  });
+
+  // 去低頻，避免隆隆
+  const hp = new Tone.Filter({
+    type: "highpass",
+    frequency: 700,
+    rolloff: -24,
+  });
+
+  // 聚焦沙沙頻段
+  agentAmbientFilter = new Tone.Filter({
+    type: "bandpass",
+    frequency: 1400,
+    Q: 1.4,
+  });
+
+  const reverb = new Tone.Reverb({
+    decay: 1.2,
+    wet: 0.18,
+  });
+
+  // 很小聲（你要的）
+  const gain = new Tone.Gain(0.08);
+
+  agentAmbientSynth.chain(hp, agentAmbientFilter, reverb, gain, Tone.Destination);
+
+  agentAmbientLoop = new Tone.Loop((time) => {
+    const v = getAgentSpeedValueFromGA(); // 0~5
+
+    // 越快越密
+    const baseInterval = 1.1;
+    const minInterval = 0.35;
+    const interval = baseInterval - (baseInterval - minInterval) * (v / 5);
+    agentAmbientLoop.interval = interval;
+
+    // 越快稍微亮一點 & 稍微大聲一點（幅度克制）
+    const bright = 1100 + 1200 * (v / 5); // 1100~2300
+    agentAmbientFilter.frequency.rampTo(bright, 0.12);
+
+    const vol = 0.06 + 0.05 * (v / 5); // 0.06~0.11
+    gain.gain.rampTo(vol, 0.15);
+
+    // 一次 loop 刷 2~4 下
+    const strokes = 2 + Math.floor(Math.random() * 3); // 2~4
+    const gap = interval / (strokes * 2.2);
+
+    for (let i = 0; i < strokes; i++) {
+      const t = time + i * gap + Math.random() * 0.02;
+
+      // 微抖動讓草更自然
+      const jitter = (Math.random() - 0.5) * 250; // ±125Hz
+      agentAmbientFilter.frequency.setValueAtTime(bright + jitter, t);
+
+      // ✅ 重要：用「秒數」！不要用 "32n" 之類字串（會炸掉導致沒畫面）
+      agentAmbientSynth.triggerAttackRelease(0.03, t);
+    }
+  }, 1.0);
+
+  agentAmbientLoop.start(0);
+
+  if (Tone.Transport.state !== "started") {
+    Tone.Transport.start();
+  }
+}
+
+/* ───────── 吸引生物的點擊音效初始化 ───────── */
 function setupAgentClickSoundRhythm() {
   if (!Tone) return;
 
   renderer.domElement.addEventListener("pointerdown", async () => {
     try {
-      // 第一次點擊時解鎖 Audio Context
       if (!audioReady) {
         await Tone.start();
         await Tone.getContext().resume();
         audioReady = true;
+
+        // 第一次解鎖 audio 時，啟動「生物移動的草原沙沙環境音」
+        ensureAgentAmbientSound();
       }
 
       const now = Tone.now();
 
-      // 第一次點：沒有前一個時間，就給中間值 2.5
       let speedValue = 2.5;
 
       if (lastClickTime !== null) {
         const delta = now - lastClickTime; // 秒
-        // 我們假設：0.1s 非常快點、1.2s 很慢點
         const MIN_DELTA = 0.1;
         const MAX_DELTA = 1.2;
 
         const clamped = Math.max(MIN_DELTA, Math.min(MAX_DELTA, delta));
-        // clamped = MIN_DELTA → t = 0（超快） / clamped = MAX_DELTA → t = 1（很慢）
         const t = (clamped - MIN_DELTA) / (MAX_DELTA - MIN_DELTA);
 
-        // t = 0 → value = 5（超快） / t = 1 → value = 0（慢）
         speedValue = (1 - t) * 5;
       }
 
       lastClickTime = now;
 
-      // 用換算出來的「click speed」觸發水滴聲
+      // ✅ 點擊聲：不改（仍是水滴）
       playAgentSoundFromValue(speedValue);
     } catch (err) {
       console.error("[audio] Tone.js 點擊音效啟動失敗：", err);

@@ -110,21 +110,12 @@ const Field = {
  * 營養源場 (Nutrient field)
  * ======================== */
 
-// 內部營養源儲存陣列（力場用）
+// 內部營養源儲存陣列
 const nutrientPoints = [];
 
-// 額外：營養源視覺物件
-let nutrientObjects = []; // { mesh, pos, active, pulsePhase }
-
-// 近距離作用範圍（力場）
+// 近距離作用範圍
 const NUTRIENT_INNER_R = 1.0;
 const NUTRIENT_OUTER_R = 6.0;
-
-// 生物「吃到」營養源的碰撞半徑
-const NUTRIENT_ABSORB_RADIUS = 1.2;
-
-// 場上營養源數量
-const NUTRIENT_COUNT = 32;
 
 export function setNutrientPoints(points) {
   nutrientPoints.length = 0;
@@ -378,7 +369,7 @@ function applyTrailSensingForce(agentIndex, accOut) {
 }
 
 /* ========================
- * 發光控制 (per object uGlow)
+ * 발광 제어 (per object uGlow)
  * ======================== */
 function enablePerObjectGlow(node) {
   const mats = [];
@@ -562,136 +553,6 @@ function depositTrail(x, z, amount = TRAIL_DEPOSIT_AMOUNT) {
 }
 
 /* ========================
- * 營養源：小太陽 Mesh 生成與管理
- * ======================== */
-
-// 在地形上某個 XZ 生成一顆發光小太陽
-function spawnNutrientAt(x, z) {
-  if (!scene) return null;
-
-  let p;
-  if (sampler) {
-    const hit = sampler(x, z);
-    p = hit.point.clone();
-    p.y += 0.35;
-  } else {
-    p = new THREE.Vector3(x, 0.35, z);
-  }
-
-  const sphereGeo = new THREE.SphereGeometry(0.35, 16, 16);
-  const sphereMat = new THREE.MeshStandardMaterial({
-    color: new THREE.Color(1.0, 0.9, 0.4),
-    emissive: new THREE.Color(1.0, 0.7, 0.15),
-    emissiveIntensity: 2.7,
-    metalness: 0.0,
-    roughness: 0.25,
-  });
-
-  const core = new THREE.Mesh(sphereGeo, sphereMat);
-
-  // 小太陽外側淡淡光暈
-  const haloGeo = new THREE.RingGeometry(0.5, 0.9, 32);
-  const haloMat = new THREE.MeshBasicMaterial({
-    color: new THREE.Color(1.0, 0.85, 0.3),
-    transparent: true,
-    opacity: 0.65,
-    side: THREE.DoubleSide,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false
-  });
-  const halo = new THREE.Mesh(haloGeo, haloMat);
-  halo.rotation.x = -Math.PI * 0.5;
-
-  const group = new THREE.Group();
-  group.add(core);
-  group.add(halo);
-  group.position.copy(p);
-  group.castShadow = false;
-  group.receiveShadow = false;
-  scene.add(group);
-
-  nutrientObjects.push({
-    mesh: group,
-    pos: p.clone(),
-    active: true,
-    pulsePhase: Math.random() * Math.PI * 2
-  });
-
-  // 讓力場也感受到這顆營養源
-  addNutrientPoint(p.x, p.y, p.z);
-
-  return group;
-}
-
-// 在地形上隨機散佈多顆營養源
-function scatterNutrients() {
-  if (!terrainRoot) return;
-  nutrientObjects.forEach((n) => {
-    if (n.mesh && n.mesh.parent) n.mesh.parent.remove(n.mesh);
-  });
-  nutrientObjects = [];
-  nutrientPoints.length = 0;
-
-  const size = terrainRoot?.userData?.size ?? (BOUND_RADIUS * 2);
-  const maxR = Math.min(size * 0.45, BOUND_RADIUS * 0.85);
-
-  for (let i = 0; i < NUTRIENT_COUNT; i++) {
-    const ang = Math.random() * Math.PI * 2;
-    const r = Math.sqrt(Math.random()) * maxR;
-    const x = Math.cos(ang) * r;
-    const z = Math.sin(ang) * r;
-    spawnNutrientAt(x, z);
-  }
-}
-
-// 生物碰到營養源 → 吸收
-function tryAbsorbNutrients(agent) {
-  if (!nutrientObjects.length) return;
-
-  for (let i = 0; i < nutrientObjects.length; i++) {
-    const n = nutrientObjects[i];
-    if (!n.active) continue;
-
-    const dx = n.pos.x - agent.pos.x;
-    const dz = n.pos.z - agent.pos.z;
-    const d2 = dx * dx + dz * dz;
-    if (d2 > NUTRIENT_ABSORB_RADIUS * NUTRIENT_ABSORB_RADIUS) continue;
-
-    // 被吃掉
-    n.active = false;
-    if (n.mesh && n.mesh.parent) {
-      n.mesh.parent.remove(n.mesh);
-    }
-
-    // 從 nutrientPoints 中移除對應點（簡單依距離找最近的）
-    let bestK = -1;
-    let bestDist = 1e9;
-    for (let k = 0; k < nutrientPoints.length; k++) {
-      const p = nutrientPoints[k];
-      const dx2 = p.x - n.pos.x;
-      const dz2 = p.z - n.pos.z;
-      const d22 = dx2 * dx2 + dz2 * dz2;
-      if (d22 < bestDist) {
-        bestDist = d22;
-        bestK = k;
-      }
-    }
-    if (bestK >= 0) {
-      nutrientPoints.splice(bestK, 1);
-    }
-
-    // 生物獲得能量加成
-    agent.nutrientBoostTimer = (agent.nutrientBoostTimer || 0) + 2.0;
-
-    // 吃到的一瞬間補一點光脈衝
-    Field.sun.heatPulse += 0.1;
-
-    // 一隻生物同一時間吃一個就好
-    break;
-  }
-}
-
-/* ========================
  * 初始化
  * ======================== */
 
@@ -832,8 +693,6 @@ export function initBoids({
       trailPoints: [p.clone()],
       trailLine,
       trailColor: new THREE.Color(1.0, 0.7, 0.2),
-      // 營養加成計時
-      nutrientBoostTimer: 0.0,
     };
 
     agents.push(agent);
@@ -843,9 +702,6 @@ export function initBoids({
   if (initialGenomes && initialGenomes.length) {
     applyPopulationGenomes(initialGenomes);
   }
-
-  // 在地形上放置營養源
-  scatterNutrients();
 
   // pointer→XZ
   raycaster = new THREE.Raycaster();
@@ -958,17 +814,6 @@ export function updateBoids(dt, tSec) {
 
   if (!agents.length) return;
 
-  // 0.5) 更新營養源視覺：輕微呼吸 & 跳動
-  for (const n of nutrientObjects) {
-    if (!n.active || !n.mesh) continue;
-    n.pulsePhase += dt * 2.4;
-    const puls = 0.7 + 0.3 * Math.sin(n.pulsePhase);
-    const hop = 0.05 * Math.sin(n.pulsePhase * 1.7);
-
-    n.mesh.scale.setScalar(puls);
-    n.mesh.position.y = n.pos.y + hop;
-  }
-
   // 熱圈位置 / 半徑
   const groundAtSun = sampler ? sampler(Field.sun.pos.x, Field.sun.pos.y).point.y : 0;
   heatGroup.position.set(Field.sun.pos.x, groundAtSun + 0.01, Field.sun.pos.y);
@@ -987,12 +832,6 @@ export function updateBoids(dt, tSec) {
 
     a.obj.visible = true;
     if (a.trailLine) a.trailLine.visible = true;
-
-    // nutrient boost 計時
-    if (a.nutrientBoostTimer > 0) {
-      a.nutrientBoostTimer = Math.max(0, a.nutrientBoostTimer - dt);
-    }
-    const nutrientBoost = clamp(a.nutrientBoostTimer / 2.0, 0.0, 1.0); // 0~1
 
     // lifeScale / lifeVisibility: 0~1 決定「有多活著」
     let lifeScale = 1.0;
@@ -1150,7 +989,7 @@ export function updateBoids(dt, tSec) {
     a.vel.x = (a.vel.x + ax * dt) * damp;
     a.vel.z = (a.vel.z + az * dt) * damp;
 
-    const maxSp = PARAM.MAX_SPEED * speedFactor * (1.0 + 0.25 * nutrientBoost);
+    const maxSp = PARAM.MAX_SPEED * speedFactor;
     const sp = Math.hypot(a.vel.x, a.vel.z);
     if (sp > maxSp) {
       const s = maxSp / sp;
@@ -1162,15 +1001,11 @@ export function updateBoids(dt, tSec) {
     a.pos.x += a.vel.x * dt;
     a.pos.z += a.vel.z * dt;
 
-    // 經過時如果碰到營養源 → 吸收
-    tryAbsorbNutrients(a);
-
     // 지나간 자리에 trail 남기기 (Deposit)
-    const trailDepositBoost = 1.0 + 1.4 * nutrientBoost;
     depositTrail(
       a.pos.x,
       a.pos.z,
-      TRAIL_DEPOSIT_AMOUNT * lifeVisibility * trailDepositBoost
+      TRAIL_DEPOSIT_AMOUNT * lifeVisibility
     );
 
     // 5) 地形 貼地 + 坡度對齊
@@ -1215,20 +1050,18 @@ export function updateBoids(dt, tSec) {
     // 6.5) trail 강도 → 크기 / 밝기 반영
     const trailStrength = getTrailStrengthAt(a.pos); // 0~1
 
-    // 身體大小：trail + lifeScale + 營養加成
+    // 몸 크기: trail + lifeScale
     const sizeMulTrail = 0.8 + 0.5 * trailStrength;
-    const sizeMulNutrient = 1.0 + 0.4 * nutrientBoost;
-    const finalScale = a.baseScale * sizeMulTrail * sizeMulNutrient * lifeScale;
+    const finalScale = a.baseScale * sizeMulTrail * lifeScale;
     a.obj.scale.setScalar(finalScale);
 
-    // 7) 熱暈 (紅色發光) + lifeVisibility + trailGlow + 營養 Glow
+    // 7) 熱暈 (紅色發光) + lifeVisibility + trailGlow
     let g = (rhoSun - PARAM.GLOW_INNER) / (PARAM.GLOW_OUTER - PARAM.GLOW_INNER);
     g = clamp(g, 0, 1);
     g = g * g * g;
 
     const trailGlowBoost = 0.7 * trailStrength;
-    const nutrientGlowBoost = 0.6 * nutrientBoost;
-    g = clamp(g + trailGlowBoost + nutrientGlowBoost, 0, 1);
+    g = clamp(g + trailGlowBoost, 0, 1);
 
     // 死亡/誕生過程中，同步淡入淡出
     g *= lifeVisibility;
@@ -1249,13 +1082,12 @@ export function updateBoids(dt, tSec) {
       const mat = a.trailLine.material;
       const tTrail = trailStrength; // 0~1
       let alpha = 0.2 + 0.8 * tTrail;
-      alpha *= (0.5 + 0.5 * nutrientBoost); // 吃過營養的軌跡更亮一點
-      alpha *= lifeVisibility;             // 死亡時一起變淡，新生時慢慢變亮
+      alpha *= lifeVisibility;      // 死亡時一起變淡，新生時慢慢變亮
       mat.opacity = alpha;
       mat.needsUpdate = true;
 
       // 顏色已在 applyGenomeToBoid 依照身體顏色設定過，
-      // 這裡就讓亮暗由 trail 強度 / lifeVisibility / nutrientBoost 決定即可。
+      // 這裡就讓亮暗由 trail 強度 / lifeVisibility 決定即可。
     }
   }
 
