@@ -22,6 +22,13 @@ import {
 import { LSystemPlant } from "./lsystem.js";
 import { GeneticAlgorithm } from "./ga.js";
 
+// 전역 Tone.js 객체를 모듈 내부로 끌어오기
+const Tone = window.Tone;
+
+if (!Tone) {
+  console.error("[audio] Tone.js가 로드되지 않았습니다. index.html 스크립트 순서를 확인하세요.");
+}
+
 /* ───────── L-System 樹木參數 ───────── */
 const INITIAL_PLANT_COUNT = 18;
 const MIN_SCALE_BY_CHAR = 3.4;
@@ -99,7 +106,9 @@ function findHighestPointOnTerrain(terrain, samples = 560) {
     const z = THREE.MathUtils.lerp(min.z, max.z, Math.random());
     const h = rayDownYToTerrain(terrain, x, z, max.y + 300);
     if (!h) continue;
-    if (!best || h.point.y > best.point.y) best = { point: h.point.clone() };
+    if (!best || h.point.y > best.point.y) {
+      best = { point: h.point.clone() };
+    }
   }
   return best ? best.point : new THREE.Vector3(0, 0, 0);
 }
@@ -147,8 +156,6 @@ async function init() {
        Gen0：ga.js 內部會把全部 patternId 設為 initialPatternId (預設 0) */
     ga = new GeneticAlgorithm({
       ...GA_CONFIG,
-      // slotPatternIds: null,
-      // lockPatternSlots: false,
     });
     const initialPop = ga.initPopulation();
 
@@ -173,6 +180,11 @@ async function init() {
 
     /* 5) 啟動 Loop */
     update(0);
+
+    /* 6) 設定「用點擊控制節奏」的音效：
+       平常不出聲，只在點擊叫他們靠過來時發出水滴聲，
+       點擊越快 → 聲音節奏越快、音色越緊張。 */
+    setupAgentClickSoundRhythm();
   } catch (err) {
     console.error("[main] 初始化錯誤：", err);
   }
@@ -322,7 +334,7 @@ function updateGAHud() {
     sumSpan.textContent =
       `패턴分布 P0~P4: [${patternCount.join(", ")}], ` +
       `平均 몸집: ${avgScale.toFixed(2)}, ` +
-      `平均 속도: ${avgSpeed.toFixed(2)}`;
+      `平均 속度: ${avgSpeed.toFixed(2)}`;
   }
 }
 
@@ -410,6 +422,9 @@ function update(dt) {
       triggerNextGeneration();
     }
   }
+
+  // ✅ 現在：update 裡面不自動出聲
+  // 只有點擊時才會透過 setupAgentClickSoundRhythm() 觸發 playAgentSoundFromValue()
 }
 
 (function animate() {
@@ -463,6 +478,102 @@ function setupUI() {
       updateLabel();
     });
   }
+}
+
+/* ───────── 音效：speed → 水滴聲 ───────── */
+
+/**
+ * 這裡不再用「固定的物理 speed」，而是用「兩次點擊之間的時間間隔」來當作 speed。
+ * 點擊越快 → 間隔越短 → 映射到越高的 value（0~5） → 聲音越高、越亮、越短。
+ */
+function playAgentSoundFromValue(value) {
+  if (!Tone) return;
+
+  // 確保在 0~5 之間
+  const v = Math.max(0, Math.min(5, value));
+
+  // 1) Pitch mapping: C6 ~ C7 附近的水滴感頻率
+  const minFreq = 900;
+  const maxFreq = 2000;
+  const freq = minFreq + (maxFreq - minFreq) * (v / 5);
+
+  // 2) 亮度：filter cutoff 跟著 speed 上升
+  const cutoff = 800 + 2400 * (v / 5);
+
+  // 3) 持續時間：速度越快越短
+  const dur = 0.18 - 0.12 * (v / 5); // 0.18 → 0.06 秒
+
+  const synth = new Tone.MembraneSynth({
+    pitchDecay: 0.005,
+    octaves: 2,
+    envelope: {
+      attack: 0.005,
+      decay: dur,
+      sustain: 0.0,
+      release: 0.05,
+    },
+  });
+
+  const filter = new Tone.Filter({
+    type: "lowpass",
+    frequency: cutoff,
+    rolloff: -24,
+  });
+
+  synth.connect(filter).toDestination();
+
+  const now = Tone.now();
+  synth.triggerAttackRelease(freq, dur, now);
+}
+
+/* 
+ * 點擊節奏 → 聲音節奏
+ * - 不點擊：完全沒聲音
+ * - 點擊一次：出現一顆水滴
+ * - 點擊越快：因為間隔越短，所以映射的 value 越高 → 聲音越急促
+ */
+let audioReady = false;
+let lastClickTime = null;
+
+function setupAgentClickSoundRhythm() {
+  if (!Tone) return;
+
+  renderer.domElement.addEventListener("pointerdown", async () => {
+    try {
+      // 第一次點擊時解鎖 Audio Context
+      if (!audioReady) {
+        await Tone.start();
+        await Tone.getContext().resume();
+        audioReady = true;
+      }
+
+      const now = Tone.now();
+
+      // 第一次點：沒有前一個時間，就給中間值 2.5
+      let speedValue = 2.5;
+
+      if (lastClickTime !== null) {
+        const delta = now - lastClickTime; // 秒
+        // 我們假設：0.1s 非常快點、1.2s 很慢點
+        const MIN_DELTA = 0.1;
+        const MAX_DELTA = 1.2;
+
+        const clamped = Math.max(MIN_DELTA, Math.min(MAX_DELTA, delta));
+        // clamped = MIN_DELTA → t = 0（超快） / clamped = MAX_DELTA → t = 1（很慢）
+        const t = (clamped - MIN_DELTA) / (MAX_DELTA - MIN_DELTA);
+
+        // t = 0 → value = 5（超快） / t = 1 → value = 0（慢）
+        speedValue = (1 - t) * 5;
+      }
+
+      lastClickTime = now;
+
+      // 用換算出來的「click speed」觸發水滴聲
+      playAgentSoundFromValue(speedValue);
+    } catch (err) {
+      console.error("[audio] Tone.js 點擊音效啟動失敗：", err);
+    }
+  });
 }
 
 function setGrowButtonState(active) {
